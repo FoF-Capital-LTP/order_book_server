@@ -164,12 +164,22 @@ async fn handle_socket(
 
                             info!("Client message: {text}");
 
-                            if let Ok(value) = serde_json::from_str::<ClientMessage>(text) {
-                                receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone()).await;
-                            }
-                            else {
-                                let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
-                                send_socket_message(&mut socket, msg).await;
+                            match serde_json::from_str::<ClientMessage>(text) {
+                                Ok(ClientMessage::Ping) => {
+                                    // HyperLiquid official ws protocol: reply with raw {"channel":"pong"}.
+                                    // Bypasses ServerResponse because that enum forces a `data` field
+                                    // and the official pong has no data.
+                                    if let Err(err) = socket.send(FrameView::text(r#"{"channel":"pong"}"#.to_string())).await {
+                                        error!("Failed to send pong: {err}");
+                                    }
+                                }
+                                Ok(value) => {
+                                    receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone()).await;
+                                }
+                                Err(_) => {
+                                    let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
+                                    send_socket_message(&mut socket, msg).await;
+                                }
                             }
                         }
                         OpCode::Close => {
@@ -196,6 +206,7 @@ async fn receive_client_message(
 ) {
     let subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
+        ClientMessage::Ping => return, // handled by caller before reaching here
     };
     // this is used for display purposes only, hence unwrap_or_default. It also shouldn't fail
     let sub = serde_json::to_string(&subscription).unwrap_or_default();
@@ -207,6 +218,7 @@ async fn receive_client_message(
     let (word, success) = match &client_message {
         ClientMessage::Subscribe { .. } => ("", manager.subscribe(subscription)),
         ClientMessage::Unsubscribe { .. } => ("un", manager.unsubscribe(subscription)),
+        ClientMessage::Ping => return, // unreachable; Ping is handled in caller and short-circuited above
     };
     if success {
         let snapshot_msg = if let ClientMessage::Subscribe { subscription } = &client_message {

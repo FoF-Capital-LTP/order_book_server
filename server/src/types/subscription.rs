@@ -12,6 +12,9 @@ pub(crate) const DEFAULT_LEVELS: usize = 20;
 pub(crate) enum ClientMessage {
     Subscribe { subscription: Subscription },
     Unsubscribe { subscription: Subscription },
+    /// Application-level heartbeat from HyperLiquid's official ws protocol.
+    /// Server replies with the raw JSON `{"channel":"pong"}`.
+    Ping,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -148,5 +151,12 @@ mod test {
                 subscription: Subscription::L2Book { n_sig_figs: None, n_levels: None, mantissa: None, .. },
             }
         ));
+    }
+
+    #[test]
+    fn test_client_message_ping_deserialization() {
+        // HyperLiquid official ws protocol heartbeat
+        let msg: ClientMessage = serde_json::from_str(r#"{"method":"ping"}"#).unwrap();
+        assert!(matches!(msg, ClientMessage::Ping));
     }
 }
