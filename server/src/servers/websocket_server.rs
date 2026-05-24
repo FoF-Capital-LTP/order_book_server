@@ -11,7 +11,7 @@ use crate::{
         subscription::{ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager},
     },
 };
-use axum::{Router, response::IntoResponse, routing::get};
+use axum::{Router, response::IntoResponse, routing::get, serve::ListenerExt};
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info};
 use std::{
@@ -61,7 +61,12 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
         }),
     );
 
-    let listener = TcpListener::bind(address).await?;
+    let listener = TcpListener::bind(address).await?
+        .tap_io(|tcp_stream| {
+            if let Err(err) = tcp_stream.set_nodelay(true) {
+                log::error!("Failed to set TCP_NODELAY on incoming connection: {err:#}");
+            }
+        });
     info!("WebSocket server running at ws://{address}");
 
     if let Err(err) = axum::serve(listener, app.into_make_service()).await {
