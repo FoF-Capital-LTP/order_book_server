@@ -421,9 +421,11 @@ impl DirectoryListener for OrderBookListener {
                         self.order_book_state.as_ref().map(OrderBookState::height),
                         &line[..100],
                     );
+                    let line_start_offset = line.as_ptr() as usize - data.as_ptr() as usize;
+                    let bytes_to_rewind = total_len - line_start_offset;
                     #[allow(clippy::unwrap_used)]
-                    let total_len: i64 = total_len.try_into().unwrap();
-                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-total_len));
+                    let rewind_len: i64 = bytes_to_rewind.try_into().unwrap();
+                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-rewind_len));
                     break;
                 }
             };
