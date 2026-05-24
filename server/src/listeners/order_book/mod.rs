@@ -69,7 +69,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     watcher.watch(&fills_dir, RecursiveMode::Recursive)?;
     watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
     let start = Instant::now() + Duration::from_secs(5);
-    let mut ticker = interval_at(start, Duration::from_secs(10));
+    let mut ticker = interval_at(start, Duration::from_secs(60));
     loop {
         tokio::select! {
             event = fs_event_rx.recv() =>  match event {
