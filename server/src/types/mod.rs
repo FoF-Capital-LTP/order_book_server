@@ -57,22 +57,26 @@ impl L2Book {
 }
 
 impl Trade {
-    #[allow(clippy::unwrap_used)]
-    pub(crate) fn from_fills(mut fills: HashMap<Side, NodeDataFill>) -> Self {
-        let NodeDataFill(seller, ask_fill) = fills.remove(&Side::Ask).unwrap();
-        let NodeDataFill(buyer, bid_fill) = fills.remove(&Side::Bid).unwrap();
+    /// Build a `Trade` from a pair of fills (one Ask + one Bid sharing the same `tid`).
+    /// Returns `None` for malformed inputs (missing one side, mismatched coin/tid),
+    /// since fills can occasionally arrive same-sided (e.g. self-trade or liquidation
+    /// bookkeeping) and must be skipped rather than crash the streaming task.
+    pub(crate) fn from_fills(mut fills: HashMap<Side, NodeDataFill>) -> Option<Self> {
+        let NodeDataFill(seller, ask_fill) = fills.remove(&Side::Ask)?;
+        let NodeDataFill(buyer, bid_fill) = fills.remove(&Side::Bid)?;
+        if ask_fill.coin != bid_fill.coin || ask_fill.tid != bid_fill.tid {
+            return None;
+        }
         let ask_is_taker = ask_fill.crossed;
         let side = if ask_is_taker { Side::Ask } else { Side::Bid };
         let coin = ask_fill.coin.clone();
-        assert_eq!(coin, bid_fill.coin);
         let tid = ask_fill.tid;
-        assert_eq!(tid, bid_fill.tid);
         let px = ask_fill.px;
         let sz = ask_fill.sz;
         let hash = ask_fill.hash;
         let time = ask_fill.time;
         let users = [buyer, seller];
-        Self { coin, side, px, sz, hash, time, tid, users }
+        Some(Self { coin, side, px, sz, hash, time, tid, users })
     }
 }
 
@@ -154,4 +158,86 @@ pub(crate) struct Liquidation {
     liquidated_user: String,
     mark_px: String,
     method: String,
+}
+
+#[cfg(test)]
+mod test {
+    use super::{Fill, NodeDataFill, Trade};
+    use crate::order_book::types::Side;
+    use alloy::primitives::Address;
+    use std::collections::HashMap;
+
+    fn fill(side: Side, tid: u64, coin: &str, crossed: bool) -> NodeDataFill {
+        NodeDataFill(
+            Address::ZERO,
+            Fill {
+                coin: coin.to_string(),
+                px: "100".into(),
+                sz: "1".into(),
+                side,
+                time: 0,
+                start_position: "0".into(),
+                dir: "Buy".into(),
+                closed_pnl: "0".into(),
+                hash: "0x0".into(),
+                oid: 0,
+                crossed,
+                fee: "0".into(),
+                tid,
+                fee_token: "USDC".into(),
+                liquidation: None,
+            },
+        )
+    }
+
+    #[test]
+    fn from_fills_ask_bid_pair_returns_trade() {
+        let mut h = HashMap::new();
+        h.insert(Side::Ask, fill(Side::Ask, 1, "BTC", true));
+        h.insert(Side::Bid, fill(Side::Bid, 1, "BTC", false));
+        let trade = Trade::from_fills(h).expect("normal Ask+Bid pair must produce a trade");
+        assert_eq!(trade.tid, 1);
+        assert_eq!(trade.coin, "BTC");
+        // ask_is_taker=true => taker side recorded as Ask
+        assert_eq!(trade.side, Side::Ask);
+    }
+
+    #[test]
+    fn from_fills_bid_taker_records_bid_side() {
+        let mut h = HashMap::new();
+        h.insert(Side::Ask, fill(Side::Ask, 7, "ETH", false));
+        h.insert(Side::Bid, fill(Side::Bid, 7, "ETH", true));
+        let trade = Trade::from_fills(h).unwrap();
+        assert_eq!(trade.side, Side::Bid);
+    }
+
+    #[test]
+    fn from_fills_missing_bid_returns_none() {
+        let mut h = HashMap::new();
+        h.insert(Side::Ask, fill(Side::Ask, 1, "BTC", true));
+        assert!(Trade::from_fills(h).is_none());
+    }
+
+    #[test]
+    fn from_fills_missing_ask_returns_none() {
+        let mut h = HashMap::new();
+        h.insert(Side::Bid, fill(Side::Bid, 1, "BTC", false));
+        assert!(Trade::from_fills(h).is_none());
+    }
+
+    #[test]
+    fn from_fills_mismatched_coin_returns_none() {
+        let mut h = HashMap::new();
+        h.insert(Side::Ask, fill(Side::Ask, 1, "BTC", true));
+        h.insert(Side::Bid, fill(Side::Bid, 1, "ETH", false));
+        assert!(Trade::from_fills(h).is_none());
+    }
+
+    #[test]
+    fn from_fills_mismatched_tid_returns_none() {
+        let mut h = HashMap::new();
+        h.insert(Side::Ask, fill(Side::Ask, 1, "BTC", true));
+        h.insert(Side::Bid, fill(Side::Bid, 2, "BTC", false));
+        assert!(Trade::from_fills(h).is_none());
+    }
 }

@@ -2,7 +2,7 @@ use crate::{
     listeners::order_book::{
         InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
     },
-    order_book::{Coin, Snapshot},
+    order_book::{Coin, Side, Snapshot},
     prelude::*,
     types::{
         L2Book, L4Book, L4BookUpdates, L4Order, Trade,
@@ -281,24 +281,34 @@ async fn send_ws_data_from_snapshot(
 }
 
 fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
-    let mut fills = batch.clone().events();
-    let mut trades = HashMap::new();
-    while fills.len() >= 2 {
-        let f2 = fills.pop();
-        let f1 = fills.pop();
-        if let Some(f1) = f1 {
-            if let Some(f2) = f2 {
-                let mut fills = HashMap::new();
-                fills.insert(f1.1.side, f1);
-                fills.insert(f2.1.side, f2);
-                let trade = Trade::from_fills(fills);
-                let coin = trade.coin.clone();
-                trades.entry(coin).or_insert_with(Vec::new).push(trade);
+    // Group fills by trade id. A valid trade has exactly one Ask + one Bid fill
+    // sharing the same `tid`. Anything else (single-sided fills, same-side pairs
+    // from self-trades or liquidation bookkeeping) is skipped with a warning.
+    let fills = batch.clone().events();
+    let mut by_tid: HashMap<u64, HashMap<Side, NodeDataFill>> = HashMap::new();
+    let mut order: Vec<u64> = Vec::new();
+    for fill in fills {
+        let tid = fill.1.tid;
+        let side = fill.1.side;
+        let entry = by_tid.entry(tid).or_insert_with(|| {
+            order.push(tid);
+            HashMap::new()
+        });
+        entry.insert(side, fill);
+    }
+    let mut trades: HashMap<String, Vec<Trade>> = HashMap::new();
+    for tid in order {
+        if let Some(group) = by_tid.remove(&tid) {
+            match Trade::from_fills(group) {
+                Some(trade) => {
+                    let coin = trade.coin.clone();
+                    trades.entry(coin).or_default().push(trade);
+                }
+                None => {
+                    log::warn!("Skipping malformed fill group for tid={tid}");
+                }
             }
         }
-    }
-    for list in trades.values_mut() {
-        list.reverse();
     }
     trades
 }
@@ -374,5 +384,81 @@ impl Subscription {
             return Err("Snapshot Failed".into());
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::coin_to_trades;
+    use crate::types::node_data::{Batch, NodeDataFill};
+
+    fn make_batch(fills_json: &str) -> Batch<NodeDataFill> {
+        let s = format!(
+            r#"{{"local_time":"2026-05-24T00:00:00","block_time":"2026-05-24T00:00:00","block_number":1,"events":{fills_json}}}"#
+        );
+        serde_json::from_str(&s).expect("batch fixture must parse")
+    }
+
+    fn fill(side: &str, tid: u64, coin: &str, crossed: bool) -> String {
+        format!(
+            r#"["0x0000000000000000000000000000000000000000",{{"coin":"{coin}","px":"100","sz":"1","side":"{side}","time":0,"startPosition":"0","dir":"Buy","closedPnl":"0","hash":"0x0","oid":0,"crossed":{crossed},"fee":"0","tid":{tid},"feeToken":"USDC","liquidation":null}}]"#
+        )
+    }
+
+    #[test]
+    fn coin_to_trades_pairs_ask_and_bid_by_tid() {
+        let fills = format!("[{},{}]", fill("A", 1, "BTC", true), fill("B", 1, "BTC", false));
+        let batch = make_batch(&fills);
+        let trades = coin_to_trades(&batch);
+        assert_eq!(trades.get("BTC").map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn coin_to_trades_skips_same_side_only_no_panic() {
+        // Two Ask fills with the same tid would crash the old impl.
+        let fills = format!("[{},{}]", fill("A", 1, "BTC", true), fill("A", 1, "BTC", false));
+        let batch = make_batch(&fills);
+        let trades = coin_to_trades(&batch);
+        assert!(trades.get("BTC").is_none());
+    }
+
+    #[test]
+    fn coin_to_trades_skips_unpaired_single_fill() {
+        let fills = format!("[{}]", fill("A", 5, "ETH", true));
+        let batch = make_batch(&fills);
+        let trades = coin_to_trades(&batch);
+        assert!(trades.is_empty());
+    }
+
+    #[test]
+    fn coin_to_trades_groups_by_tid_not_adjacency() {
+        // Order: Ask(tid=1), Ask(tid=2), Bid(tid=1), Bid(tid=2)
+        // Old impl would pair adjacent (tid=1+tid=2) and panic on same-side groups.
+        // New impl groups by tid -> two valid trades.
+        let fills = format!(
+            "[{},{},{},{}]",
+            fill("A", 1, "BTC", true),
+            fill("A", 2, "BTC", true),
+            fill("B", 1, "BTC", false),
+            fill("B", 2, "BTC", false),
+        );
+        let batch = make_batch(&fills);
+        let trades = coin_to_trades(&batch);
+        assert_eq!(trades.get("BTC").map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn coin_to_trades_groups_by_coin() {
+        let fills = format!(
+            "[{},{},{},{}]",
+            fill("A", 1, "BTC", true),
+            fill("B", 1, "BTC", false),
+            fill("A", 2, "ETH", true),
+            fill("B", 2, "ETH", false),
+        );
+        let batch = make_batch(&fills);
+        let trades = coin_to_trades(&batch);
+        assert_eq!(trades.get("BTC").map(Vec::len), Some(1));
+        assert_eq!(trades.get("ETH").map(Vec::len), Some(1));
     }
 }
