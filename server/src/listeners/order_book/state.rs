@@ -1,7 +1,7 @@
 use crate::{
     listeners::order_book::{L2Snapshots, TimedSnapshots, utils::compute_l2_snapshots},
     order_book::{
-        Coin, InnerOrder, Oid,
+        Coin, InnerOrder, Oid, Px,
         multi_book::{OrderBooks, Snapshots},
     },
     prelude::*,
@@ -103,6 +103,11 @@ impl OrderBookState {
                         // must replace time with time of entering book, which is the timestamp of the order status update
                         #[allow(clippy::unwrap_used)]
                         inner_order.convert_trigger(time.try_into().unwrap());
+                        // For stop market/limit triggers, status.order.limitPx is the trigger
+                        // condition price, not the resting price on the book. The actual price
+                        // the order rests at is on the diff event itself. For ordinary limit
+                        // orders the two are equal, so this is a no-op there.
+                        inner_order.limit_px = Px::parse_from_str(diff.px())?;
                         self.order_book.add_order(inner_order);
                     } else {
                         return Err(format!("Unable to find order opening status {diff:?}").into());
