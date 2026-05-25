@@ -1,4 +1,5 @@
-use crate::types::{L2Book, L4Book, Trade};
+use crate::types::{L2Book, L4Book, Trade, WsOrder, WsUserFills};
+use alloy::primitives::Address;
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -27,6 +28,16 @@ pub(crate) enum Subscription {
     L2Book { coin: String, n_sig_figs: Option<u32>, n_levels: Option<usize>, mantissa: Option<u64> },
     #[serde(rename_all = "camelCase")]
     L4Book { coin: String },
+    #[serde(rename_all = "camelCase")]
+    OrderUpdates { user: Address },
+    /// `aggregateByTime` is accepted for protocol compatibility but ignored:
+    /// we always forward raw fills as the node provides them.
+    #[serde(rename_all = "camelCase")]
+    UserFills {
+        user: Address,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        aggregate_by_time: Option<bool>,
+    },
 }
 
 impl Subscription {
@@ -72,6 +83,12 @@ impl Subscription {
                 info!("Valid subscription");
                 true
             }
+            // OrderUpdates/UserFills are user-scoped, not coin-scoped: the address
+            // is validated structurally at deserialization, so we accept any.
+            Self::OrderUpdates { .. } | Self::UserFills { .. } => {
+                info!("Valid subscription");
+                true
+            }
         }
     }
 }
@@ -84,6 +101,8 @@ pub(crate) enum ServerResponse {
     L2Book(L2Book),
     L4Book(L4Book),
     Trades(Vec<Trade>),
+    OrderUpdates(Vec<WsOrder>),
+    UserFills(WsUserFills),
     Error(String),
 }
 
@@ -158,5 +177,47 @@ mod test {
         // HyperLiquid official ws protocol heartbeat
         let msg: ClientMessage = serde_json::from_str(r#"{"method":"ping"}"#).unwrap();
         assert!(matches!(msg, ClientMessage::Ping));
+    }
+
+    #[test]
+    fn test_subscribe_order_updates_deserialization() {
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"method":"subscribe","subscription":{"type":"orderUpdates","user":"0x0000000000000000000000000000000000000001"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            msg,
+            ClientMessage::Subscribe { subscription: Subscription::OrderUpdates { .. } }
+        ));
+    }
+
+    #[test]
+    fn test_subscribe_user_fills_deserialization() {
+        // aggregateByTime omitted — must default to None
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"method":"subscribe","subscription":{"type":"userFills","user":"0x0000000000000000000000000000000000000001"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            msg,
+            ClientMessage::Subscribe {
+                subscription: Subscription::UserFills { aggregate_by_time: None, .. },
+            }
+        ));
+    }
+
+    #[test]
+    fn test_subscribe_user_fills_with_aggregate_deserialization() {
+        // aggregateByTime present — accepted for protocol compatibility, ignored at runtime.
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"method":"subscribe","subscription":{"type":"userFills","user":"0x0000000000000000000000000000000000000001","aggregateByTime":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            msg,
+            ClientMessage::Subscribe {
+                subscription: Subscription::UserFills { aggregate_by_time: Some(true), .. },
+            }
+        ));
     }
 }

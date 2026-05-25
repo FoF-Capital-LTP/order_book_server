@@ -160,6 +160,73 @@ pub(crate) struct Liquidation {
     method: String,
 }
 
+/// HyperLiquid `WsBasicOrder` (the `order` payload inside `WsOrder`).
+/// Field set is fixed by the public ws protocol; do not add or remove fields
+/// without checking the docs first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WsBasicOrder {
+    pub coin: String,
+    pub side: Side,
+    pub limit_px: String,
+    pub sz: String,
+    pub oid: u64,
+    pub timestamp: u64,
+    /// Original size at placement. The node's `order_statuses` stream does not
+    /// carry the original size, so we forward `sz` here. For `open` events
+    /// `sz == origSz` exactly; for `filled` / `canceled` events this reports
+    /// the size still on the order at the moment of the status, not the
+    /// originally-placed size.
+    pub orig_sz: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloid: Option<String>,
+}
+
+/// HyperLiquid `WsOrder`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WsOrder {
+    pub order: WsBasicOrder,
+    pub status: String,
+    pub status_timestamp: u64,
+}
+
+impl WsOrder {
+    pub(crate) fn from_node_status(status: &NodeDataOrderStatus) -> Self {
+        let o = &status.order;
+        Self {
+            order: WsBasicOrder {
+                coin: o.coin.clone(),
+                side: o.side,
+                limit_px: o.limit_px.clone(),
+                sz: o.sz.clone(),
+                oid: o.oid,
+                timestamp: o.timestamp,
+                orig_sz: o.sz.clone(),
+                cloid: o.cloid.clone(),
+            },
+            status: status.status.clone(),
+            status_timestamp: status.time.and_utc().timestamp_millis().max(0) as u64,
+        }
+    }
+}
+
+/// HyperLiquid `WsUserFills` payload. `WsFill` is the existing `Fill` struct,
+/// whose camelCase serialization already matches the documented wire format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WsUserFills {
+    /// Per HL docs, the first push on a fresh subscription has `isSnapshot: true`;
+    /// streaming updates omit the field. We currently never have a fill history
+    /// to replay, so we always emit `isSnapshot: true` once with an empty `fills`
+    /// vec on subscribe (see `handle_immediate_snapshot`) and leave it `None`
+    /// (omitted) on every subsequent streaming push.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_snapshot: Option<bool>,
+    pub user: Address,
+    pub fills: Vec<Fill>,
+}
+
 #[cfg(test)]
 mod test {
     use super::{Fill, NodeDataFill, Trade};

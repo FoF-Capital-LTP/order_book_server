@@ -5,12 +5,13 @@ use crate::{
     order_book::{Coin, Side, Snapshot},
     prelude::*,
     types::{
-        L2Book, L4Book, L4BookUpdates, L4Order, Trade,
+        Fill, L2Book, L4Book, L4BookUpdates, L4Order, Trade, WsOrder, WsUserFills,
         inner::InnerLevel,
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::{ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager},
     },
 };
+use alloy::primitives::Address;
 use axum::{Router, response::IntoResponse, routing::get, serve::ListenerExt};
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info};
@@ -129,14 +130,18 @@ async fn handle_socket(
                             },
                             InternalMessage::Fills{ batch } => {
                                 let mut trades = coin_to_trades(batch);
+                                let mut user_fills = user_to_fills(batch);
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
+                                    send_ws_data_from_user_fills(&mut socket, sub, &mut user_fills).await;
                                 }
                             },
                             InternalMessage::L4BookUpdates{ diff_batch, status_batch } => {
                                 let mut book_updates = coin_to_book_updates(diff_batch, status_batch);
+                                let mut user_orders = user_to_order_updates(status_batch);
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
+                                    send_ws_data_from_order_updates(&mut socket, sub, &mut user_orders).await;
                                 }
                             },
                         }
@@ -371,6 +376,55 @@ async fn send_ws_data_from_trades(
     }
 }
 
+/// Group raw node fills by user. Each `NodeDataFill` is a `(Address, Fill)`
+/// pair, so the same physical fill belongs to exactly one user (the maker or
+/// taker side recorded on that node event); this matches HL's per-user push
+/// where each side gets its own `userFills` notification.
+fn user_to_fills(batch: &Batch<NodeDataFill>) -> HashMap<Address, Vec<Fill>> {
+    let mut by_user: HashMap<Address, Vec<Fill>> = HashMap::new();
+    for NodeDataFill(user, fill) in batch.clone().events() {
+        by_user.entry(user).or_default().push(fill);
+    }
+    by_user
+}
+
+/// Group node order-status events by user and convert each one to a `WsOrder`.
+fn user_to_order_updates(status_batch: &Batch<NodeDataOrderStatus>) -> HashMap<Address, Vec<WsOrder>> {
+    let mut by_user: HashMap<Address, Vec<WsOrder>> = HashMap::new();
+    for status in status_batch.clone().events() {
+        let user = status.user;
+        by_user.entry(user).or_default().push(WsOrder::from_node_status(&status));
+    }
+    by_user
+}
+
+async fn send_ws_data_from_user_fills(
+    socket: &mut WebSocket,
+    subscription: &Subscription,
+    user_fills: &mut HashMap<Address, Vec<Fill>>,
+) {
+    if let Subscription::UserFills { user, .. } = subscription {
+        if let Some(fills) = user_fills.remove(user) {
+            // Streaming pushes omit `isSnapshot` per HL docs.
+            let msg = ServerResponse::UserFills(WsUserFills { is_snapshot: None, user: *user, fills });
+            send_socket_message(socket, msg).await;
+        }
+    }
+}
+
+async fn send_ws_data_from_order_updates(
+    socket: &mut WebSocket,
+    subscription: &Subscription,
+    user_orders: &mut HashMap<Address, Vec<WsOrder>>,
+) {
+    if let Subscription::OrderUpdates { user } = subscription {
+        if let Some(orders) = user_orders.remove(user) {
+            let msg = ServerResponse::OrderUpdates(orders);
+            send_socket_message(socket, msg).await;
+        }
+    }
+}
+
 impl Subscription {
     // snapshots that begin a stream
     async fn handle_immediate_snapshot(
@@ -395,6 +449,17 @@ impl Subscription {
             }
             return Err("Snapshot Failed".into());
         }
+        if let Self::UserFills { user, .. } = self {
+            // HL protocol: first message after subscribe carries `isSnapshot: true`.
+            // We have no historical fill store, so we honour the wire shape with an
+            // empty fills array. Subsequent streaming pushes omit `isSnapshot`.
+            return Ok(Some(ServerResponse::UserFills(WsUserFills {
+                is_snapshot: Some(true),
+                user: *user,
+                fills: Vec::new(),
+            })));
+        }
+        // orderUpdates has no documented snapshot push — HL streams events only.
         Ok(None)
     }
 }
