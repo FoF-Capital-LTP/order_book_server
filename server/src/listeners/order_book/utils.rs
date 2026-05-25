@@ -1,7 +1,7 @@
 use crate::{
     listeners::order_book::{L2SnapshotParams, L2Snapshots},
     order_book::{
-        Snapshot,
+        Coin, Snapshot,
         multi_book::{OrderBooks, Snapshots},
         types::InnerOrder,
     },
@@ -44,11 +44,18 @@ pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
     Ok(output_path)
 }
 
+/// Validate that the local order book state matches the authoritative snapshot.
+///
+/// Returns the set of coins present in `expected` but absent from local
+/// `snapshot` (the "extra" books). The caller can graft these into local
+/// state to absorb newly-listed coins without restarting the listener.
+/// Per-order divergences and missing-on-server cases are still hard errors,
+/// because they signal real state corruption rather than a benign coin add.
 pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
     snapshot: &Snapshots<O>,
     expected: Snapshots<O>,
     ignore_spot: bool,
-) -> Result<()> {
+) -> Result<HashMap<Coin, Snapshot<O>>> {
     let mut snapshot_map: HashMap<_, _> =
         expected.value().into_iter().filter(|(c, _)| !c.is_spot() || !ignore_spot).collect();
 
@@ -71,10 +78,10 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
             return Err(format!("Missing {} book", coin.value()).into());
         }
     }
-    if !snapshot_map.is_empty() {
-        return Err("Extra orderbooks detected".to_string().into());
-    }
-    Ok(())
+    // Remaining entries in snapshot_map are "extra" books in the authoritative
+    // snapshot — typically newly-listed coins. Return them so the caller can
+    // graft them in instead of dying.
+    Ok(snapshot_map)
 }
 
 impl L2SnapshotParams {

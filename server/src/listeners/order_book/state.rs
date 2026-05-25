@@ -1,7 +1,7 @@
 use crate::{
     listeners::order_book::{L2Snapshots, TimedSnapshots, utils::compute_l2_snapshots},
     order_book::{
-        Coin, InnerOrder, Oid, Px,
+        Coin, InnerOrder, Oid, Px, Snapshot,
         multi_book::{OrderBooks, Snapshots},
     },
     prelude::*,
@@ -59,6 +59,21 @@ impl OrderBookState {
 
     pub(super) fn compute_universe(&self) -> HashSet<Coin> {
         self.order_book.as_ref().keys().cloned().collect()
+    }
+
+    /// Graft fetched snapshots for previously-untracked coins into local state.
+    /// Used to absorb newly-listed assets without restarting the listener.
+    pub(super) fn absorb_extra_books(
+        &mut self,
+        extras: HashMap<Coin, Snapshot<InnerL4Order>>,
+        ignore_triggers: bool,
+    ) {
+        for (coin, snapshot) in extras {
+            if self.ignore_spot && coin.is_spot() {
+                continue;
+            }
+            self.order_book.insert_book(coin, snapshot, ignore_triggers);
+        }
     }
 
     pub(super) fn apply_updates(

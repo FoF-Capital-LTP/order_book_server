@@ -51,6 +51,15 @@ impl<O: InnerOrder> OrderBooks<O> {
         self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).add_order(order);
     }
 
+    /// Graft a fetched snapshot for a new coin into this multi-book.
+    /// Used to absorb coins that appeared in the authoritative snapshot but
+    /// were not yet tracked locally (e.g. newly-listed assets), avoiding a
+    /// listener restart. Caller is responsible for ensuring `coin` is not
+    /// already tracked.
+    pub(crate) fn insert_book(&mut self, coin: Coin, snapshot: Snapshot<O>, ignore_triggers: bool) {
+        self.order_books.insert(coin, OrderBook::from_snapshot(snapshot, ignore_triggers));
+    }
+
     pub(crate) fn cancel_order(&mut self, oid: Oid, coin: Coin) -> bool {
         self.order_books.get_mut(&coin).is_some_and(|book| book.cancel_order(oid))
     }

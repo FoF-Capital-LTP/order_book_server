@@ -14,7 +14,7 @@ use crate::{
 };
 use alloy::primitives::Address;
 use fs::File;
-use log::{error, info};
+use log::{error, info, warn};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::{
     cmp::Ordering,
@@ -171,7 +171,27 @@ fn fetch_snapshot(
                             }
                             let stored_snapshot = state.compute_snapshot().snapshot;
                             info!("Validating snapshot");
-                            validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot)
+                            match validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot) {
+                                Ok(extras) if extras.is_empty() => Ok(()),
+                                Ok(extras) => {
+                                    // Newly-listed (or previously-ignored) coins appeared in the
+                                    // authoritative snapshot but not in our local state. Graft them
+                                    // in so the listener does not have to restart.
+                                    let coins: Vec<_> =
+                                        extras.keys().map(|c| c.value().to_string()).collect();
+                                    warn!(
+                                        "Absorbing {} extra orderbook(s) from fetched snapshot: {:?}",
+                                        extras.len(),
+                                        coins
+                                    );
+                                    let mut listener = listener.lock().await;
+                                    if let Some(state) = listener.order_book_state.as_mut() {
+                                        state.absorb_extra_books(extras, true);
+                                    }
+                                    Ok(())
+                                }
+                                Err(err) => Err(err),
+                            }
                         } else {
                             listener.lock().await.init_from_snapshot(expected_snapshot, height);
                             Ok(())
