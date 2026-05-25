@@ -183,8 +183,12 @@ pub(crate) struct WsBasicOrder {
 }
 
 /// HyperLiquid `WsOrder`.
+///
+/// Note: HL's public ws docs document this field as `statusTimestamp`
+/// (camelCase). We intentionally serialize it as `status_timestamp`
+/// (snake_case) to stay wire-compatible with downstream consumers
+/// (e.g. fofex) that historically deserialize the snake_case form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct WsOrder {
     pub order: WsBasicOrder,
     pub status: String,
