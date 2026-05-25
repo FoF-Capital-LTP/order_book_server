@@ -1,5 +1,4 @@
 use crate::{
-    HL_NODE,
     listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
     order_book::{
         Coin, Snapshot,
@@ -122,10 +121,15 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
                 fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
             }
-            () = sleep(Duration::from_secs(5)) => {
+            // 30s rather than 5s: hl-visor occasionally swaps upstream peers
+            // (early-eof from peer, bootstrap, reconnect) which produces a
+            // 5-15s gap with no new blocks and therefore no fs events. A 5s
+            // threshold treats those routine failovers as fatals; 30s tolerates
+            // them while still catching genuine "watcher went deaf" cases.
+            () = sleep(Duration::from_secs(30)) => {
                 let listener = listener.lock().await;
                 if listener.is_ready() {
-                    return Err(format!("Stream has fallen behind ({HL_NODE} failed?)").into());
+                    return Err("No file events for 30s — watcher may have stopped or hl-node fell badly behind".into());
                 }
             }
         }
