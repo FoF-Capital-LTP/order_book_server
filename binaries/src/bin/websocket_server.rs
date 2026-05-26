@@ -31,6 +31,19 @@ struct Args {
 async fn main() -> Result<()> {
     env_logger::init();
 
+    // Abort the whole process on any thread panic. Without this, a panic in a
+    // tokio worker (e.g. inside the listener task or the notify watcher
+    // callback) only kills that single task: the runtime stays up, the HTTP
+    // port stays bound, and systemd sees the service as healthy while the
+    // listener is silently dead. Forcing an abort lets systemd's Restart=always
+    // recover the service. We call the default hook first so we still get the
+    // panic message + backtrace in the logs before exiting.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        std::process::abort();
+    }));
+
     let args = Args::parse();
 
     let full_address = format!("{}:{}", args.address, args.port);

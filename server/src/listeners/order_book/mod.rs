@@ -443,7 +443,7 @@ impl DirectoryListener for OrderBookListener {
                     error!(
                         "{event_source} serialization error {err}, height: {:?}, line: {:?}",
                         self.order_book_state.as_ref().map(OrderBookState::height),
-                        &line[..100],
+                        &line[..line.len().min(100)],
                     );
                     let line_start_offset = line.as_ptr() as usize - data.as_ptr() as usize;
                     let bytes_to_rewind = total_len - line_start_offset;
