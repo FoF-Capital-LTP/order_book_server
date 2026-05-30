@@ -167,7 +167,13 @@ async fn handle_socket(
                                 }
                             };
 
-                            info!("Client message: {text}");
+                            // Demoted from info!: clients heartbeat with
+                            // {"method":"ping"} every ~3-5 s, and with
+                            // multiple subscribers this single line was
+                            // ~50% of journald volume. debug! keeps it
+                            // available under RUST_LOG=debug for protocol
+                            // forensics without flooding production logs.
+                            log::debug!("Client message: {text}");
 
                             match serde_json::from_str::<ClientMessage>(text) {
                                 Ok(ClientMessage::Ping) => {
@@ -322,7 +328,13 @@ fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
                     trades.entry(coin).or_default().push(trade);
                 }
                 None => {
-                    log::warn!("Skipping malformed fill group for tid={tid}");
+                    // Expected for self-trades, single-sided fills, and
+                    // liquidation bookkeeping (see comment at top of fn).
+                    // Demoted from warn to debug because under RUST_LOG=warn
+                    // it produced ~76 lines/sec — drowning the real
+                    // diagnostics signals (BatchQueue overflow, lag-watchdog,
+                    // not-yet-grafted coin warns).
+                    log::debug!("Skipping malformed fill group for tid={tid}");
                 }
             }
         }

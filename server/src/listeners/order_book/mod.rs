@@ -13,7 +13,7 @@ use crate::{
 };
 use alloy::primitives::Address;
 use fs::File;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::{
     cmp::Ordering,
@@ -185,11 +185,20 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
             // "Expecting block X got Y". This was the root cause of all the
             // daily 01:00 UTC fatals.
             _ = lag_ticker.tick() => {
+                // fs_event_overflow is independent of fetch_snapshot timing
+                // (it signals inotify-channel saturation, which a slow
+                // snapshot validation does not cause), so check it
+                // unconditionally.
                 if fs_event_overflow.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err("fs event channel overflowed — listener consumer was starved".into());
                 }
                 let listener = listener.lock().await;
-                if listener.is_ready() {
+                // Skip the wall-clock block_time lag check while a snapshot
+                // fetch is in flight: validate_snapshot_consistency walks
+                // every coin/order pair and the consumer can legitimately
+                // stall past MAX_BLOCK_TIME_LAG_MS during that window.
+                // Without this, a slow snapshot would trip a spurious fatal.
+                if listener.is_ready() && !listener.is_fetching_snapshot() {
                     if let Some(lag_ms) = listener.block_time_lag_ms() {
                         if lag_ms > MAX_BLOCK_TIME_LAG_MS {
                             return Err(format!(
@@ -336,6 +345,17 @@ impl OrderBookListener {
 
     pub(crate) const fn is_ready(&self) -> bool {
         self.order_book_state.is_some()
+    }
+
+    /// True while a snapshot fetch is in flight. The lag watchdog uses this
+    /// to skip the wall-clock block_time check, since snapshot validation
+    /// (file parse + per-coin/per-order walk in validate_snapshot_consistency)
+    /// can stall the consumer for >MAX_BLOCK_TIME_LAG_MS on a busy book
+    /// without indicating real lag. The fs_event_overflow signal stays
+    /// unconditional — that's an independent inotify-channel saturation
+    /// signal, not a consumer-stall signal.
+    pub(crate) const fn is_fetching_snapshot(&self) -> bool {
+        self.fetched_snapshot_cache.is_some()
     }
 
     pub(crate) fn universe(&self) -> HashSet<Coin> {
@@ -551,8 +571,13 @@ impl DirectoryListener for OrderBookListener {
                     break;
                 }
             };
-            if height % 100 == 0 {
-                info!("{event_source} block: {height}");
+            if height % 1000 == 0 {
+                // Demoted from info! and rate from /100 to /1000 blocks: at
+                // ~14.5 blocks/s the old cadence produced three INFO lines
+                // every ~7 s per stream (Fills+OrderStatuses+OrderDiffs).
+                // /1000 ≈ once per stream per ~70 s, and debug! keeps it
+                // out of the journal under RUST_LOG=warn,server=info.
+                debug!("{event_source} block: {height}");
             }
             if let Err(err) = self.receive_batch(event_batch) {
                 self.order_book_state = None;
@@ -603,8 +628,10 @@ impl OrderBookListener {
             };
             match res {
                 Ok((height, event_batch)) => {
-                    if height % 100 == 0 {
-                        info!("{event_source} block: {height}");
+                    if height % 1000 == 0 {
+                        // Same cadence/level rationale as the live-file path
+                        // above. Keep this in sync with that other site.
+                        debug!("{event_source} block: {height}");
                     }
                     if let Err(err) = self.receive_batch(event_batch) {
                         self.order_book_state = None;
@@ -612,13 +639,21 @@ impl OrderBookListener {
                     }
                 }
                 Err(err) => {
-                    // The previous-hour file is closed; a parse error here
-                    // means truly malformed data, not partial flush. Log and
-                    // skip rather than rewind (file handle is being dropped).
+                    // The previous-hour file is closed by hl-node, so a
+                    // parse error here is *not* an EOF-mid-line (those only
+                    // happen on the live current-hour file). It's truly
+                    // malformed data — propagating subsequent lines into
+                    // receive_batch could push corrupt state forward and
+                    // cause an "Expecting block X got Y" fatal far later
+                    // that's hard to diagnose. Better to fail loudly here
+                    // and let systemd restart with a fresh snapshot fetch.
                     error!(
-                        "{event_source} stream parse error: {err}, line: {:?}",
+                        "{event_source} stream parse error on closed previous-hour file: {err}, line: {:?}",
                         &line[..line.len().min(100)]
                     );
+                    return Err(format!(
+                        "Stream parse error in closed {event_source} file: {err}"
+                    ).into());
                 }
             }
         }

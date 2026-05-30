@@ -1,6 +1,6 @@
 use crate::types::{L2Book, L4Book, Trade, WsOrder, WsUserFills};
 use alloy::primitives::Address;
-use log::info;
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -72,7 +72,12 @@ impl Subscription {
                     info!("Invalid subscription: mantissa can not be some if sig figs are not set");
                     return false;
                 }
-                info!("Valid subscription");
+                // Demoted from info!: emitted once per accepted Subscribe
+                // frame, no per-call context (coin/user), so it dominates
+                // journald during reconnect storms (800+ lines in 10 s on
+                // service restart). Keep `Invalid subscription: ...` at
+                // info! — those have diagnostic value.
+                debug!("Valid subscription");
                 true
             }
             Self::L4Book { coin } => {
@@ -80,13 +85,13 @@ impl Subscription {
                     info!("Invalid subscription: coin not found");
                     return false;
                 }
-                info!("Valid subscription");
+                debug!("Valid subscription");
                 true
             }
             // OrderUpdates/UserFills are user-scoped, not coin-scoped: the address
             // is validated structurally at deserialization, so we accept any.
             Self::OrderUpdates { .. } | Self::UserFills { .. } => {
-                info!("Valid subscription");
+                debug!("Valid subscription");
                 true
             }
         }

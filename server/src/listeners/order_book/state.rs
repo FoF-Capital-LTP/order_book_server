@@ -13,6 +13,12 @@ use crate::{
 use log::warn;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Don't re-warn about the same not-yet-grafted coin more often than this
+/// many blocks. ~14.5 blocks/s ⇒ 200 blocks ≈ 14 seconds. Keeps the log
+/// readable when a high-activity new coin appears between snapshot fetches
+/// (default fetch interval is 60 s).
+const NOT_YET_GRAFTED_WARN_THROTTLE_BLOCKS: u64 = 200;
+
 #[derive(Clone)]
 pub(super) struct OrderBookState {
     order_book: OrderBooks<InnerL4Order>,
@@ -20,6 +26,9 @@ pub(super) struct OrderBookState {
     time: u64,
     snapped: bool,
     ignore_spot: bool,
+    /// Throttle map for "skipping <Op> for not-yet-grafted coin" warnings.
+    /// Value is the block height at which we last warned for that coin.
+    not_yet_grafted_last_warn: HashMap<Coin, u64>,
 }
 
 impl OrderBookState {
@@ -36,6 +45,22 @@ impl OrderBookState {
             height,
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
             snapped: false,
+            not_yet_grafted_last_warn: HashMap::new(),
+        }
+    }
+
+    /// Returns true if the caller should emit a warn for `coin` at `height`,
+    /// false if the previous warn for that coin was within
+    /// `NOT_YET_GRAFTED_WARN_THROTTLE_BLOCKS`. Updates the throttle map on
+    /// emit. Cleared opportunistically when a coin gets grafted in
+    /// `absorb_extra_books`.
+    fn should_warn_not_yet_grafted(&mut self, coin: &Coin, height: u64) -> bool {
+        match self.not_yet_grafted_last_warn.get(coin) {
+            Some(&last) if height.saturating_sub(last) < NOT_YET_GRAFTED_WARN_THROTTLE_BLOCKS => false,
+            _ => {
+                self.not_yet_grafted_last_warn.insert(coin.clone(), height);
+                true
+            }
         }
     }
 
@@ -73,6 +98,9 @@ impl OrderBookState {
             if self.ignore_spot && coin.is_spot() {
                 continue;
             }
+            // Once grafted, drop any throttle entry so a future re-deletion
+            // (defensive, shouldn't normally happen) gets a fresh warn.
+            self.not_yet_grafted_last_warn.remove(&coin);
             self.order_book.insert_book(coin, snapshot, ignore_triggers);
         }
     }
@@ -136,11 +164,13 @@ impl OrderBookState {
                     // absorb it and bring local state into sync. Hard-erroring
                     // here would crash the listener for a benign add.
                     if !self.order_book.has_book(&coin) {
-                        warn!(
-                            "Skipping Update for not-yet-grafted coin {} oid {:?}; waiting for absorb_extra_books",
-                            coin.value(),
-                            oid
-                        );
+                        if self.should_warn_not_yet_grafted(&coin, height) {
+                            warn!(
+                                "Skipping Update for not-yet-grafted coin {} oid {:?} at block {height}; waiting for absorb_extra_books",
+                                coin.value(),
+                                oid
+                            );
+                        }
                         continue;
                     }
                     if !self.order_book.modify_sz(oid, coin, new_sz) {
@@ -149,11 +179,13 @@ impl OrderBookState {
                 }
                 InnerOrderDiff::Remove => {
                     if !self.order_book.has_book(&coin) {
-                        warn!(
-                            "Skipping Remove for not-yet-grafted coin {} oid {:?}; waiting for absorb_extra_books",
-                            coin.value(),
-                            oid
-                        );
+                        if self.should_warn_not_yet_grafted(&coin, height) {
+                            warn!(
+                                "Skipping Remove for not-yet-grafted coin {} oid {:?} at block {height}; waiting for absorb_extra_books",
+                                coin.value(),
+                                oid
+                            );
+                        }
                         continue;
                     }
                     if !self.order_book.cancel_order(oid, coin) {

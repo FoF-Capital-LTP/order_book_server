@@ -18,7 +18,16 @@ use std::collections::VecDeque;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    time::Duration,
 };
+
+/// Timeout for the snapshot fetch POST to localhost:3001/info. The hl-node
+/// info server normally responds in <100 ms; a 30 s ceiling is generous
+/// enough to absorb a slow disk during snapshot serialization but tight
+/// enough that we don't let `fetched_snapshot_cache` grow unbounded if the
+/// info server hangs (which would silently re-trigger the original
+/// 23 GB-RSS class of bug).
+const SNAPSHOT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
     let output_path = dir.join("out.json");
@@ -33,7 +42,7 @@ pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
         "includeHeightInOutput": true
     });
 
-    let client = Client::new();
+    let client = Client::builder().timeout(SNAPSHOT_FETCH_TIMEOUT).build()?;
     client
         .post("http://localhost:3001/info")
         .header("Content-Type", "application/json")
