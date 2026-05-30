@@ -64,6 +64,14 @@ impl<O: InnerOrder> OrderBooks<O> {
         self.order_books.get_mut(&coin).is_some_and(|book| book.cancel_order(oid))
     }
 
+    /// Returns true if a book is currently tracked for `coin`. Used to detect
+    /// diffs that arrived for a not-yet-grafted (newly-listed) asset so the
+    /// listener can skip them gracefully and let absorb_extra_books catch up
+    /// on the next snapshot fetch instead of dying with a fatal.
+    pub(crate) fn has_book(&self, coin: &Coin) -> bool {
+        self.order_books.contains_key(coin)
+    }
+
     // change size to reflect how much gets matched during the block
     pub(crate) fn modify_sz(&mut self, oid: Oid, coin: Coin, sz: Sz) -> bool {
         self.order_books.get_mut(&coin).is_some_and(|book| book.modify_sz(oid, sz))

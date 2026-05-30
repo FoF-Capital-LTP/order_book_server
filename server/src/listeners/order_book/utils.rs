@@ -131,6 +131,13 @@ pub(super) enum EventBatch {
     Fills(Batch<NodeDataFill>),
 }
 
+/// Maximum number of unprocessed Batches a single BatchQueue may hold before
+/// the listener treats the backlog as runaway lag and bails. At ~14.5
+/// blocks/s this is roughly ~70 minutes of buffered events per stream — more
+/// than enough to absorb a snapshot fetch + peer failover but tight enough
+/// that we can't silently grow to 23 GB RSS again.
+pub(super) const BATCH_QUEUE_CAP: usize = 60_000;
+
 pub(super) struct BatchQueue<T> {
     deque: VecDeque<Batch<T>>,
     last_ts: Option<u64>,
@@ -141,15 +148,27 @@ impl<T> BatchQueue<T> {
         Self { deque: VecDeque::new(), last_ts: None }
     }
 
-    pub(super) fn push(&mut self, block: Batch<T>) -> bool {
+    /// Push a batch, returning `Ok(true)` if it was inserted, `Ok(false)` if
+    /// it was a stale/duplicate height (silently dropped), or `Err` if the
+    /// queue exceeds `BATCH_QUEUE_CAP`. Callers should escalate the Err so
+    /// systemd can restart and the lag-watchdog can take over.
+    pub(super) fn push(&mut self, block: Batch<T>) -> Result<bool> {
         if let Some(last_ts) = self.last_ts {
             if last_ts >= block.block_number() {
-                return false;
+                return Ok(false);
             }
+        }
+        if self.deque.len() >= BATCH_QUEUE_CAP {
+            return Err(format!(
+                "BatchQueue overflow: {} unprocessed batches (cap {}). Listener consumer is starved.",
+                self.deque.len(),
+                BATCH_QUEUE_CAP
+            )
+            .into());
         }
         self.last_ts = Some(block.block_number());
         self.deque.push_back(block);
-        true
+        Ok(true)
     }
 
     pub(super) fn pop_front(&mut self) -> Option<Batch<T>> {

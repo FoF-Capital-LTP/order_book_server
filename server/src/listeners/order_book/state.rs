@@ -10,6 +10,7 @@ use crate::{
         node_data::{Batch, NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
+use log::warn;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Clone)]
@@ -129,11 +130,32 @@ impl OrderBookState {
                     }
                 }
                 InnerOrderDiff::Update { new_sz, .. } => {
+                    // If the book is not tracked yet, this is a newly-listed
+                    // coin whose snapshot has not been grafted via
+                    // absorb_extra_books. Skip — the next fetch_snapshot will
+                    // absorb it and bring local state into sync. Hard-erroring
+                    // here would crash the listener for a benign add.
+                    if !self.order_book.has_book(&coin) {
+                        warn!(
+                            "Skipping Update for not-yet-grafted coin {} oid {:?}; waiting for absorb_extra_books",
+                            coin.value(),
+                            oid
+                        );
+                        continue;
+                    }
                     if !self.order_book.modify_sz(oid, coin, new_sz) {
                         return Err(format!("Unable to find order on the book {diff:?}").into());
                     }
                 }
                 InnerOrderDiff::Remove => {
+                    if !self.order_book.has_book(&coin) {
+                        warn!(
+                            "Skipping Remove for not-yet-grafted coin {} oid {:?}; waiting for absorb_extra_books",
+                            coin.value(),
+                            oid
+                        );
+                        continue;
+                    }
                     if !self.order_book.cancel_order(oid, coin) {
                         return Err(format!("Unable to find order on the book {diff:?}").into());
                     }

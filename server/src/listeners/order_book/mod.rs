@@ -18,7 +18,7 @@ use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
-    io::{Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Seek, SeekFrom},
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -27,10 +27,28 @@ use tokio::{
     sync::{
         Mutex,
         broadcast::Sender,
-        mpsc::{UnboundedSender, unbounded_channel},
+        mpsc::{UnboundedSender, channel, unbounded_channel},
     },
     time::{Instant, interval_at, sleep},
 };
+
+/// Maximum fs events buffered between the notify watcher and the listener
+/// loop. The watcher fires three streams (status/diffs/fills) at roughly
+/// 14.5 blocks/s ⇒ ~45 events/s steady state, so 10k caps ~3.5 minutes of
+/// in-flight events. If the listener falls farther behind than that, we
+/// prefer to drop+fatal so systemd can restart cleanly rather than let
+/// memory and the channel grow without bound.
+const FS_EVENT_CHANNEL_CAP: usize = 10_000;
+
+/// Max permitted block_time vs wall-clock lag before the lag watchdog fires
+/// a fatal. Tuned to be generous enough to absorb a snapshot fetch +
+/// peer failover (~30-60s) but tight enough to catch the runaway case
+/// where the consumer falls so far behind that an apply_updates panic is
+/// imminent.
+const MAX_BLOCK_TIME_LAG_MS: i64 = 120_000;
+
+/// How often the lag watchdog runs. Independent of fs activity.
+const WATCHDOG_INTERVAL_SECS: u64 = 15;
 use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
 
 mod state;
@@ -46,12 +64,27 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     info!("Monitoring order diffs directory: {}", order_diffs_dir.display());
     info!("Monitoring fills directory: {}", fills_dir.display());
 
-    // monitoring the directory via the notify crate (gives file system events)
-    let (fs_event_tx, mut fs_event_rx) = unbounded_channel();
+    // Bounded channel between notify watcher and listener loop. We use
+    // try_send from the notify thread so that if we ever go full, we get
+    // an error log + a clearly-attributable fatal (overflow_flag + 30s/60s
+    // watchdog) rather than silently growing memory like the previous
+    // unbounded version did during the May 2026 lag-storm incident.
+    let (fs_event_tx, mut fs_event_rx) = channel(FS_EVENT_CHANNEL_CAP);
+    let fs_event_overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let overflow_for_watcher = fs_event_overflow.clone();
     let mut watcher = recommended_watcher(move |res| {
         let fs_event_tx = fs_event_tx.clone();
-        if let Err(err) = fs_event_tx.send(res) {
-            error!("Error sending fs event to processor via channel: {err}");
+        match fs_event_tx.try_send(res) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                overflow_for_watcher.store(true, std::sync::atomic::Ordering::SeqCst);
+                error!(
+                    "fs event channel FULL (cap {FS_EVENT_CHANNEL_CAP}); dropping event. Listener is starved — fatal."
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                error!("fs event channel closed; watcher exiting");
+            }
         }
     })?;
 
@@ -69,6 +102,10 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
     let start = Instant::now() + Duration::from_secs(5);
     let mut ticker = interval_at(start, Duration::from_secs(60));
+    // Independent periodic ticker for the lag watchdog. Uses interval_at so
+    // we don't share fate with `sleep` (which gets reset by every fs event).
+    let lag_start = Instant::now() + Duration::from_secs(WATCHDOG_INTERVAL_SECS);
+    let mut lag_ticker = interval_at(lag_start, Duration::from_secs(WATCHDOG_INTERVAL_SECS));
     loop {
         tokio::select! {
             event = fs_event_rx.recv() =>  match event {
@@ -126,10 +163,40 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
             // 5-15s gap with no new blocks and therefore no fs events. A 5s
             // threshold treats those routine failovers as fatals; 30s tolerates
             // them while still catching genuine "watcher went deaf" cases.
+            //
+            // We also check the fs_event_overflow flag here (set by the
+            // bounded watcher channel when try_send fails). If we ever drop a
+            // watcher event we cannot trust local state, so we exit and let
+            // systemd cold-restart the listener.
             () = sleep(Duration::from_secs(30)) => {
+                if fs_event_overflow.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("fs event channel overflowed — listener consumer was starved".into());
+                }
                 let listener = listener.lock().await;
                 if listener.is_ready() {
                     return Err("No file events for 30s — watcher may have stopped or hl-node fell badly behind".into());
+                }
+            }
+            // Lag watchdog: fires every WATCHDOG_INTERVAL_SECS regardless of
+            // fs activity. Catches the "events still arriving but consumer
+            // can't keep up" case — the 30s no-events branch above only
+            // catches a *dead* watcher and silently lets a backed-up watcher
+            // accumulate until it crashes at apply_updates with
+            // "Expecting block X got Y". This was the root cause of all the
+            // daily 01:00 UTC fatals.
+            _ = lag_ticker.tick() => {
+                if fs_event_overflow.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("fs event channel overflowed — listener consumer was starved".into());
+                }
+                let listener = listener.lock().await;
+                if listener.is_ready() {
+                    if let Some(lag_ms) = listener.block_time_lag_ms() {
+                        if lag_ms > MAX_BLOCK_TIME_LAG_MS {
+                            return Err(format!(
+                                "Listener block_time lag {lag_ms} ms exceeds {MAX_BLOCK_TIME_LAG_MS} ms — consumer is starved"
+                            ).into());
+                        }
+                    }
                 }
             }
         }
@@ -224,6 +291,11 @@ pub(crate) struct OrderBookListener {
     // Only Some when we want it to collect updates
     fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+    /// Most recent block_time we've observed in any incoming batch (ms since
+    /// epoch). Drives the lag watchdog so we can detect "events still
+    /// arriving but consumer can't keep up" without waiting for an
+    /// apply_updates fatal.
+    last_block_time_ms: Option<u64>,
 }
 
 impl OrderBookListener {
@@ -239,7 +311,23 @@ impl OrderBookListener {
             internal_message_tx,
             order_diff_cache: BatchQueue::new(),
             order_status_cache: BatchQueue::new(),
+            last_block_time_ms: None,
         }
+    }
+
+    /// Returns wall-clock-vs-block_time lag in ms. None if no batch seen yet
+    /// or if block_time is in the future (clock skew). Used by the lag
+    /// watchdog.
+    fn block_time_lag_ms(&self) -> Option<i64> {
+        let last = self.last_block_time_ms?;
+        let now_ms: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+            .try_into()
+            .ok()?;
+        let last_i64: i64 = last.try_into().ok()?;
+        Some(now_ms.saturating_sub(last_i64))
     }
 
     fn clone_state(&self) -> Option<OrderBookState> {
@@ -284,12 +372,15 @@ impl OrderBookListener {
     fn receive_batch(&mut self, updates: EventBatch) -> Result<()> {
         match updates {
             EventBatch::Orders(batch) => {
-                self.order_status_cache.push(batch);
+                self.last_block_time_ms = Some(self.last_block_time_ms.map_or(batch.block_time(), |prev| prev.max(batch.block_time())));
+                self.order_status_cache.push(batch)?;
             }
             EventBatch::BookDiffs(batch) => {
-                self.order_diff_cache.push(batch);
+                self.last_block_time_ms = Some(self.last_block_time_ms.map_or(batch.block_time(), |prev| prev.max(batch.block_time())));
+                self.order_diff_cache.push(batch)?;
             }
             EventBatch::Fills(batch) => {
+                self.last_block_time_ms = Some(self.last_block_time_ms.map_or(batch.block_time(), |prev| prev.max(batch.block_time())));
                 if self.last_fill.is_none_or(|height| height < batch.block_number()) {
                     // send fill updates if we received a new update
                     if let Some(tx) = &self.internal_message_tx {
@@ -408,12 +499,19 @@ impl DirectoryListener for OrderBookListener {
     }
 
     fn on_file_creation(&mut self, new_file: PathBuf, event_source: EventSource) -> Result<()> {
-        if let Some(file) = self.file_mut(event_source).as_mut() {
-            let mut buf = String::new();
-            file.read_to_string(&mut buf)?;
-            if !buf.is_empty() {
-                self.process_data(buf, event_source)?;
-            }
+        // Drain whatever is left in the previous-hour file *line by line*
+        // rather than buffering the whole thing into a String. Hour-rollover
+        // files routinely reach 5–25 GB; the previous read_to_string blew
+        // up RSS to 23 GB and held the listener mutex for many seconds,
+        // which was the trigger for the daily 01:00 UTC fatal cascade.
+        //
+        // The previous file has already been closed by hl-node (rotation
+        // already happened), so there is no risk of an EOF-mid-line — we
+        // can stream until BufRead returns 0.
+        if self.file_mut(event_source).is_some() {
+            #[allow(clippy::unwrap_used)]
+            let file = self.file_mut(event_source).take().unwrap();
+            self.stream_lines(file, event_source)?;
         }
         *self.file_mut(event_source) = Some(File::open(new_file)?);
         Ok(())
@@ -467,6 +565,70 @@ impl DirectoryListener for OrderBookListener {
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
+                    let _unused = tx.send(snapshot);
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl OrderBookListener {
+    /// Streaming variant of process_data used on hour-rollover for the
+    /// already-closed previous-hour file. Reads one line at a time via a
+    /// 1 MiB BufReader instead of slurping the whole file into a String.
+    /// Bounds RSS regardless of hourly file size.
+    fn stream_lines(&mut self, file: File, event_source: EventSource) -> Result<()> {
+        let reader = BufReader::with_capacity(1024 * 1024, file);
+        for line_res in reader.lines() {
+            let line = match line_res {
+                Ok(l) => l,
+                Err(err) => {
+                    error!("{event_source} stream read error: {err}");
+                    return Err(err.into());
+                }
+            };
+            if line.is_empty() {
+                continue;
+            }
+            let res = match event_source {
+                EventSource::Fills => serde_json::from_str::<Batch<NodeDataFill>>(&line).map(|batch| {
+                    let height = batch.block_number();
+                    (height, EventBatch::Fills(batch))
+                }),
+                EventSource::OrderStatuses => serde_json::from_str(&line)
+                    .map(|batch: Batch<NodeDataOrderStatus>| (batch.block_number(), EventBatch::Orders(batch))),
+                EventSource::OrderDiffs => serde_json::from_str(&line)
+                    .map(|batch: Batch<NodeDataOrderDiff>| (batch.block_number(), EventBatch::BookDiffs(batch))),
+            };
+            match res {
+                Ok((height, event_batch)) => {
+                    if height % 100 == 0 {
+                        info!("{event_source} block: {height}");
+                    }
+                    if let Err(err) = self.receive_batch(event_batch) {
+                        self.order_book_state = None;
+                        return Err(err);
+                    }
+                }
+                Err(err) => {
+                    // The previous-hour file is closed; a parse error here
+                    // means truly malformed data, not partial flush. Log and
+                    // skip rather than rewind (file handle is being dropped).
+                    error!(
+                        "{event_source} stream parse error: {err}, line: {:?}",
+                        &line[..line.len().min(100)]
+                    );
+                }
+            }
+        }
+        let snapshot = self.l2_snapshots(true);
+        if let Some(snapshot) = snapshot {
+            if let Some(tx) = &self.internal_message_tx {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let snapshot =
+                        Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
                     let _unused = tx.send(snapshot);
                 });
             }
