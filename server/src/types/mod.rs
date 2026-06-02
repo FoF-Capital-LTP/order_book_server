@@ -148,6 +148,8 @@ pub(crate) struct Fill {
     pub crossed: bool,
     pub fee: String,
     pub tid: u64,
+    #[serde(default)]
+    pub cloid: Option<String>,
     pub fee_token: String,
     pub liquidation: Option<Liquidation>,
 }
@@ -255,6 +257,7 @@ mod test {
                 crossed,
                 fee: "0".into(),
                 tid,
+                cloid: None,
                 fee_token: "USDC".into(),
                 liquidation: None,
             },

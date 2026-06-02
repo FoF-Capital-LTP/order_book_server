@@ -47,6 +47,19 @@ const FS_EVENT_CHANNEL_CAP: usize = 10_000;
 /// imminent.
 const MAX_BLOCK_TIME_LAG_MS: i64 = 120_000;
 
+/// Plan E: how many times in a row the same byte offset may fail to parse
+/// while still emitting an `ERROR` log on each attempt. The first few
+/// failures are normal torn-write windows (microseconds-to-tens-of-ms while
+/// hl-node finishes flushing the line); they should be visible. Beyond
+/// this count we stay silent and rate-limit a periodic WARN so the journal
+/// does not fill up and (more importantly) so the per-event log/work is
+/// small enough not to back up the bounded fs_event channel.
+const PARSE_FAIL_LOUD_RETRIES: u32 = 3;
+
+/// Plan E: minimum interval between rate-limited "still stuck" WARN lines
+/// once a single offset has failed beyond `PARSE_FAIL_LOUD_RETRIES`.
+const PARSE_FAIL_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// How often the lag watchdog runs. Independent of fs activity.
 const WATCHDOG_INTERVAL_SECS: u64 = 15;
 use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
@@ -305,10 +318,55 @@ pub(crate) struct OrderBookListener {
     /// arriving but consumer can't keep up" without waiting for an
     /// apply_updates fatal.
     last_block_time_ms: Option<u64>,
+    /// Diagnostic-only: when Some(path), the next successfully parsed batch
+    /// from that source logs its block_number under `[hour-rollover-diag]`.
+    /// Set by `on_file_creation` when opening a new hourly file, consumed by
+    /// `process_data` on first successful parse. No control-flow effect.
+    pending_first_batch_log_fills: Option<PathBuf>,
+    pending_first_batch_log_order_statuses: Option<PathBuf>,
+    pending_first_batch_log_order_diffs: Option<PathBuf>,
+    /// Plan E: per-source tracker for repeated parse failures at the same
+    /// byte offset. The seek-rewind-break path used to re-`error!` on every
+    /// fs modify event for the same stuck line, which back-pressured the
+    /// bounded fs_event channel hard enough to trip the
+    /// `fs event channel overflowed` fatal (observed 2026-06-01 15:14:29Z).
+    /// We now silence the log after `PARSE_FAIL_LOUD_RETRIES` and emit a
+    /// rate-limited WARN every `PARSE_FAIL_WARN_INTERVAL`.
+    parse_fail_fills: ParseFailureTracker,
+    parse_fail_order_statuses: ParseFailureTracker,
+    parse_fail_order_diffs: ParseFailureTracker,
+}
+
+/// Plan E: tracks "stuck on the same byte offset" state for a single
+/// `EventSource`. `Default::default()` is the cleared (no failures pending)
+/// state.
+#[derive(Default)]
+struct ParseFailureTracker {
+    /// Absolute byte offset within the currently-tracked file at which the
+    /// last unsuccessful parse occurred. None when the previous parse on
+    /// this source succeeded (or no parse has happened yet).
+    last_fail_offset: Option<u64>,
+    /// Number of consecutive failures at `last_fail_offset`. Reset to 0 on
+    /// any successful parse OR when the offset changes.
+    fail_count: u32,
+    /// Wall-clock when the current run of failures began. Used by the
+    /// rate-limited WARN to report cumulative stuck duration.
+    first_fail_at: Option<Instant>,
+    /// Last time we emitted a rate-limited WARN for this stuck offset.
+    /// None until the first WARN fires.
+    last_warn_at: Option<Instant>,
+}
+
+impl ParseFailureTracker {
+    /// Reset the tracker — a parse just succeeded at (or past) this source's
+    /// previous stuck offset, so any prior failure is no longer pending.
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 impl OrderBookListener {
-    pub(crate) const fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
+    pub(crate) fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
         Self {
             ignore_spot,
             fill_status_file: None,
@@ -321,6 +379,39 @@ impl OrderBookListener {
             order_diff_cache: BatchQueue::new(),
             order_status_cache: BatchQueue::new(),
             last_block_time_ms: None,
+            pending_first_batch_log_fills: None,
+            pending_first_batch_log_order_statuses: None,
+            pending_first_batch_log_order_diffs: None,
+            parse_fail_fills: ParseFailureTracker::default(),
+            parse_fail_order_statuses: ParseFailureTracker::default(),
+            parse_fail_order_diffs: ParseFailureTracker::default(),
+        }
+    }
+
+    /// Plan E: borrow the per-source parse-failure tracker.
+    fn parse_fail_tracker_mut(&mut self, event_source: EventSource) -> &mut ParseFailureTracker {
+        match event_source {
+            EventSource::Fills => &mut self.parse_fail_fills,
+            EventSource::OrderStatuses => &mut self.parse_fail_order_statuses,
+            EventSource::OrderDiffs => &mut self.parse_fail_order_diffs,
+        }
+    }
+
+    /// Diagnostic helper: take the pending-first-batch-log marker for a source.
+    fn take_pending_first_batch_log(&mut self, event_source: EventSource) -> Option<PathBuf> {
+        match event_source {
+            EventSource::Fills => self.pending_first_batch_log_fills.take(),
+            EventSource::OrderStatuses => self.pending_first_batch_log_order_statuses.take(),
+            EventSource::OrderDiffs => self.pending_first_batch_log_order_diffs.take(),
+        }
+    }
+
+    /// Diagnostic helper: arm the pending-first-batch-log marker for a source.
+    fn set_pending_first_batch_log(&mut self, event_source: EventSource, path: PathBuf) {
+        match event_source {
+            EventSource::Fills => self.pending_first_batch_log_fills = Some(path),
+            EventSource::OrderStatuses => self.pending_first_batch_log_order_statuses = Some(path),
+            EventSource::OrderDiffs => self.pending_first_batch_log_order_diffs = Some(path),
         }
     }
 
@@ -528,12 +619,27 @@ impl DirectoryListener for OrderBookListener {
         // The previous file has already been closed by hl-node (rotation
         // already happened), so there is no risk of an EOF-mid-line — we
         // can stream until BufRead returns 0.
-        if self.file_mut(event_source).is_some() {
+        let height_at_entry = self.order_book_state.as_ref().map(OrderBookState::height);
+        let had_prev_file = self.file_mut(event_source).is_some();
+        info!(
+            "[hour-rollover-diag] on_file_creation enter: source={event_source} new_file={} state.height={:?} had_prev_file={had_prev_file}",
+            new_file.display(),
+            height_at_entry,
+        );
+        if had_prev_file {
             #[allow(clippy::unwrap_used)]
             let file = self.file_mut(event_source).take().unwrap();
             self.stream_lines(file, event_source)?;
         }
-        *self.file_mut(event_source) = Some(File::open(new_file)?);
+        *self.file_mut(event_source) = Some(File::open(&new_file)?);
+        // Mark next successful parse on this source as the new-file first batch.
+        self.set_pending_first_batch_log(event_source, new_file.clone());
+        let height_at_exit = self.order_book_state.as_ref().map(OrderBookState::height);
+        info!(
+            "[hour-rollover-diag] on_file_creation exit: source={event_source} new_file={} state.height={:?}",
+            new_file.display(),
+            height_at_exit,
+        );
         Ok(())
     }
 
@@ -557,20 +663,71 @@ impl DirectoryListener for OrderBookListener {
             let (height, event_batch) = match res {
                 Ok(data) => data,
                 Err(err) => {
-                    // if we run into a serialization error (hitting EOF), just return to last line.
-                    error!(
-                        "{event_source} serialization error {err}, height: {:?}, line: {:?}",
-                        self.order_book_state.as_ref().map(OrderBookState::height),
-                        &line[..line.len().min(100)],
-                    );
+                    // If we run into a serialization error (hitting EOF), just return to last line.
+                    //
+                    // Plan E: the seek-rewind-break path used to `error!` on every fs modify
+                    // event for the same stuck offset. A real torn-write at 2026-06-01 15:09:44Z
+                    // produced ~150 retries × 3 sources in 5 minutes; the resulting log/work
+                    // back-pressured the bounded fs_event channel and tripped the
+                    // `fs event channel overflowed` fatal at 15:14:29Z. We now dedup by
+                    // post-rewind file offset: keep the first few attempts loud (covers normal
+                    // torn-write windows), then go silent with a rate-limited WARN.
                     let line_start_offset = line.as_ptr() as usize - data.as_ptr() as usize;
                     let bytes_to_rewind = total_len - line_start_offset;
                     #[allow(clippy::unwrap_used)]
                     let rewind_len: i64 = bytes_to_rewind.try_into().unwrap();
-                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-rewind_len));
+                    let post_rewind_offset = self
+                        .file_mut(event_source)
+                        .as_mut()
+                        .and_then(|f| {
+                            f.seek_relative(-rewind_len).ok()?;
+                            f.stream_position().ok()
+                        });
+                    let now = Instant::now();
+                    let height_for_log = self.order_book_state.as_ref().map(OrderBookState::height);
+                    let line_excerpt: &str = &line[..line.len().min(100)];
+                    let tracker = self.parse_fail_tracker_mut(event_source);
+                    let same_offset_as_last = post_rewind_offset.is_some()
+                        && tracker.last_fail_offset == post_rewind_offset;
+                    if same_offset_as_last {
+                        tracker.fail_count = tracker.fail_count.saturating_add(1);
+                    } else {
+                        tracker.last_fail_offset = post_rewind_offset;
+                        tracker.fail_count = 1;
+                        tracker.first_fail_at = Some(now);
+                        tracker.last_warn_at = None;
+                    }
+                    if tracker.fail_count <= PARSE_FAIL_LOUD_RETRIES {
+                        error!(
+                            "{event_source} serialization error {err}, height: {height_for_log:?}, line: {line_excerpt:?}",
+                        );
+                    } else {
+                        let should_warn = tracker
+                            .last_warn_at
+                            .map_or(true, |t| now.duration_since(t) >= PARSE_FAIL_WARN_INTERVAL);
+                        if should_warn {
+                            let stuck_for = tracker
+                                .first_fail_at
+                                .map(|t| now.duration_since(t))
+                                .unwrap_or_default();
+                            warn!(
+                                "[plan-e-dedup] {event_source} still stuck at offset {:?} \
+                                 after {} attempts ({}s); height: {height_for_log:?}, line: {line_excerpt:?}, \
+                                 last err: {err}",
+                                tracker.last_fail_offset,
+                                tracker.fail_count,
+                                stuck_for.as_secs(),
+                            );
+                            tracker.last_warn_at = Some(now);
+                        }
+                    }
                     break;
                 }
             };
+            // Plan E: a parse just succeeded — any prior stuck-offset state for this source
+            // is no longer pending (either the torn-write was filled in, or hl-node skipped
+            // past it on rotation). Clear the tracker so the next genuine failure is loud.
+            self.parse_fail_tracker_mut(event_source).clear();
             if height % 1000 == 0 {
                 // Demoted from info! and rate from /100 to /1000 blocks: at
                 // ~14.5 blocks/s the old cadence produced three INFO lines
@@ -578,6 +735,13 @@ impl DirectoryListener for OrderBookListener {
                 // /1000 ≈ once per stream per ~70 s, and debug! keeps it
                 // out of the journal under RUST_LOG=warn,server=info.
                 debug!("{event_source} block: {height}");
+            }
+            if let Some(path) = self.take_pending_first_batch_log(event_source) {
+                info!(
+                    "[hour-rollover-diag] live-file first batch: source={event_source} new_file={} first_block={height} state.height={:?}",
+                    path.display(),
+                    self.order_book_state.as_ref().map(OrderBookState::height),
+                );
             }
             if let Err(err) = self.receive_batch(event_batch) {
                 self.order_book_state = None;
@@ -604,12 +768,22 @@ impl OrderBookListener {
     /// 1 MiB BufReader instead of slurping the whole file into a String.
     /// Bounds RSS regardless of hourly file size.
     fn stream_lines(&mut self, file: File, event_source: EventSource) -> Result<()> {
+        let height_at_entry = self.order_book_state.as_ref().map(OrderBookState::height);
+        info!(
+            "[hour-rollover-diag] stream_lines enter: source={event_source} state.height={height_at_entry:?}"
+        );
+        let mut lines_drained: u64 = 0;
+        let mut first_height_seen: Option<u64> = None;
+        let mut last_height_seen: Option<u64> = None;
         let reader = BufReader::with_capacity(1024 * 1024, file);
         for line_res in reader.lines() {
             let line = match line_res {
                 Ok(l) => l,
                 Err(err) => {
                     error!("{event_source} stream read error: {err}");
+                    info!(
+                        "[hour-rollover-diag] stream_lines read-error exit: source={event_source} lines_drained={lines_drained} first_height_seen={first_height_seen:?} last_height_seen={last_height_seen:?}"
+                    );
                     return Err(err.into());
                 }
             };
@@ -633,8 +807,16 @@ impl OrderBookListener {
                         // above. Keep this in sync with that other site.
                         debug!("{event_source} block: {height}");
                     }
+                    if first_height_seen.is_none() {
+                        first_height_seen = Some(height);
+                    }
+                    last_height_seen = Some(height);
+                    lines_drained += 1;
                     if let Err(err) = self.receive_batch(event_batch) {
                         self.order_book_state = None;
+                        info!(
+                            "[hour-rollover-diag] stream_lines receive_batch-error exit: source={event_source} lines_drained={lines_drained} first_height_seen={first_height_seen:?} last_height_seen={last_height_seen:?}"
+                        );
                         return Err(err);
                     }
                 }
@@ -651,12 +833,19 @@ impl OrderBookListener {
                         "{event_source} stream parse error on closed previous-hour file: {err}, line: {:?}",
                         &line[..line.len().min(100)]
                     );
+                    info!(
+                        "[hour-rollover-diag] stream_lines parse-error exit: source={event_source} lines_drained={lines_drained} first_height_seen={first_height_seen:?} last_height_seen={last_height_seen:?}"
+                    );
                     return Err(format!(
                         "Stream parse error in closed {event_source} file: {err}"
                     ).into());
                 }
             }
         }
+        let height_at_exit = self.order_book_state.as_ref().map(OrderBookState::height);
+        info!(
+            "[hour-rollover-diag] stream_lines ok exit: source={event_source} lines_drained={lines_drained} first_height_seen={first_height_seen:?} last_height_seen={last_height_seen:?} state.height={height_at_exit:?}"
+        );
         let snapshot = self.l2_snapshots(true);
         if let Some(snapshot) = snapshot {
             if let Some(tx) = &self.internal_message_tx {
