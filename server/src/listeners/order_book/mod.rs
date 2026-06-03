@@ -20,7 +20,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader, Seek, SeekFrom},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -83,7 +86,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     // watchdog) rather than silently growing memory like the previous
     // unbounded version did during the May 2026 lag-storm incident.
     let (fs_event_tx, mut fs_event_rx) = channel(FS_EVENT_CHANNEL_CAP);
-    let fs_event_overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fs_event_overflow = Arc::new(AtomicBool::new(false));
     let overflow_for_watcher = fs_event_overflow.clone();
     let mut watcher = recommended_watcher(move |res| {
         let fs_event_tx = fs_event_tx.clone();
@@ -115,6 +118,12 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
     let start = Instant::now() + Duration::from_secs(5);
     let mut ticker = interval_at(start, Duration::from_secs(60));
+    // Guard against concurrent snapshot fetches. The ticker fires every 60s
+    // unconditionally, but if a previous fetch_snapshot task is still running
+    // (HTTP + file parse + validation can exceed 60s on a busy book), we skip
+    // the tick. Without this, overlapping fetches call begin_caching() which
+    // resets the cache and causes "Not enough cached updates" → fatal cascade.
+    let snapshot_in_flight = Arc::new(AtomicBool::new(false));
     // Independent periodic ticker for the lag watchdog. Uses interval_at so
     // we don't share fate with `sleep` (which gets reset by every fs event).
     let lag_start = Instant::now() + Duration::from_secs(WATCHDOG_INTERVAL_SECS);
@@ -167,9 +176,13 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 }
             }
             _ = ticker.tick() => {
-                let listener = listener.clone();
-                let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
+                if !snapshot_in_flight.load(AtomicOrdering::SeqCst) {
+                    snapshot_in_flight.store(true, AtomicOrdering::SeqCst);
+                    let listener = listener.clone();
+                    let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
+                    let in_flight = snapshot_in_flight.clone();
+                    fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot, in_flight);
+                }
             }
             // 30s rather than 5s: hl-visor occasionally swaps upstream peers
             // (early-eof from peer, bootstrap, reconnect) which produces a
@@ -230,6 +243,7 @@ fn fetch_snapshot(
     listener: Arc<Mutex<OrderBookListener>>,
     tx: UnboundedSender<Result<()>>,
     ignore_spot: bool,
+    in_flight: Arc<AtomicBool>,
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -295,6 +309,7 @@ fn fetch_snapshot(
             }
             Err(err) => Err(err),
         };
+        in_flight.store(false, AtomicOrdering::SeqCst);
         let _unused = tx.send(res);
         Ok(())
     });
