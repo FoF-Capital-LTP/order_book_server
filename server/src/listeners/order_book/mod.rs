@@ -224,7 +224,17 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 // every coin/order pair and the consumer can legitimately
                 // stall past MAX_BLOCK_TIME_LAG_MS during that window.
                 // Without this, a slow snapshot would trip a spurious fatal.
-                if listener.is_ready() && !listener.is_fetching_snapshot() {
+                //
+                // Also skip when an active torn-write stall is detected
+                // (Plan E tracker shows >30s stuck at the same offset).
+                // The consumer isn't starved — it's waiting for hl-node to
+                // flush an incomplete line. Once flushed, lag recovers
+                // instantly. Without this, a torn-write lasting >120s
+                // triggers a needless fatal+restart cycle.
+                if listener.is_ready()
+                    && !listener.is_fetching_snapshot()
+                    && !listener.has_active_parse_stall()
+                {
                     if let Some(lag_ms) = listener.block_time_lag_ms() {
                         if lag_ms > MAX_BLOCK_TIME_LAG_MS {
                             return Err(format!(
@@ -443,6 +453,24 @@ impl OrderBookListener {
             .ok()?;
         let last_i64: i64 = last.try_into().ok()?;
         Some(now_ms.saturating_sub(last_i64))
+    }
+
+    /// Returns true if any source has an active torn-write stall that has
+    /// lasted more than 30 seconds. Used by the lag watchdog to suppress
+    /// false-positive fatals during torn-write windows: the consumer is not
+    /// truly "starved" — it's blocked on an incomplete line that hl-node
+    /// hasn't flushed yet. Once the line completes, parsing resumes and the
+    /// lag drops instantly.
+    fn has_active_parse_stall(&self) -> bool {
+        const STALL_GRACE: Duration = Duration::from_secs(30);
+        let now = Instant::now();
+        [&self.parse_fail_fills, &self.parse_fail_order_statuses, &self.parse_fail_order_diffs]
+            .into_iter()
+            .any(|t| {
+                t.fail_count > PARSE_FAIL_LOUD_RETRIES
+                    && t.first_fail_at
+                        .map_or(false, |start| now.duration_since(start) > STALL_GRACE)
+            })
     }
 
     fn clone_state(&self) -> Option<OrderBookState> {

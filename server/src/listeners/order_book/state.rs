@@ -26,6 +26,14 @@ pub(super) struct OrderBookState {
     time: u64,
     snapped: bool,
     ignore_spot: bool,
+    /// When true, the next forward block gap is tolerated (height jumps
+    /// forward) instead of triggering a fatal. Set to true after snapshot
+    /// initialization because the consumer starts reading from the live file
+    /// at EOF — blocks between the snapshot height and the current write
+    /// position are missed. The first gap is expected and harmless (the
+    /// snapshot provides authoritative state); subsequent gaps indicate real
+    /// data loss and must still fatal.
+    allow_initial_gap: bool,
     /// Throttle map for "skipping <Op> for not-yet-grafted coin" warnings.
     /// Value is the block height at which we last warned for that coin.
     not_yet_grafted_last_warn: HashMap<Coin, u64>,
@@ -45,6 +53,7 @@ impl OrderBookState {
             height,
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
             snapped: false,
+            allow_initial_gap: true,
             not_yet_grafted_last_warn: HashMap::new(),
         }
     }
@@ -114,25 +123,46 @@ impl OrderBookState {
         let time = order_statuses.block_time();
         assert_eq!(order_statuses.block_number(), order_diffs.block_number());
         if height > self.height + 1 {
-            // Diagnostic for the recurring 01:00 UTC hour-rollover fatal
-            // (see [hour-rollover-diag] elsewhere). Logs the gap shape so we
-            // can tell whether this is a small drift (off-by-one race during
-            // file rotation) or a full ~one-hour jump (drain skipped / new
-            // file opens at chain tip). gap_blocks ≈ 52507 ≈ 1h*14.5 bps in
-            // the 06-01 occurrence.
-            error!(
-                "[hour-rollover-diag] apply_updates gap detected: self.height={} expected={} got={} gap_blocks={} block_time_ms={}",
-                self.height,
-                self.height + 1,
-                height,
-                height.saturating_sub(self.height),
-                time,
-            );
-            return Err(format!("Expecting block {}, got block {}", self.height + 1, height).into());
+            if self.allow_initial_gap {
+                // First gap after snapshot init — expected when the consumer
+                // starts at EOF of the current hour-file. The snapshot gives
+                // us authoritative state at self.height; blocks between
+                // self.height+1 and height-1 were written before we started
+                // reading and are safe to skip. Jump forward and continue.
+                warn!(
+                    "[fresh-start] accepting initial gap: self.height={} expected={} got={} gap_blocks={} — snapshot state is authoritative",
+                    self.height,
+                    self.height + 1,
+                    height,
+                    height.saturating_sub(self.height),
+                );
+                self.allow_initial_gap = false;
+                self.height = height - 1;
+                // Fall through to normal processing below
+            } else {
+                // Diagnostic for the recurring 01:00 UTC hour-rollover fatal
+                // (see [hour-rollover-diag] elsewhere). Logs the gap shape so we
+                // can tell whether this is a small drift (off-by-one race during
+                // file rotation) or a full ~one-hour jump (drain skipped / new
+                // file opens at chain tip). gap_blocks ≈ 52507 ≈ 1h*14.5 bps in
+                // the 06-01 occurrence.
+                error!(
+                    "[hour-rollover-diag] apply_updates gap detected: self.height={} expected={} got={} gap_blocks={} block_time_ms={}",
+                    self.height,
+                    self.height + 1,
+                    height,
+                    height.saturating_sub(self.height),
+                    time,
+                );
+                return Err(format!("Expecting block {}, got block {}", self.height + 1, height).into());
+            }
         } else if height <= self.height {
             // This is not an error in case we started caching long before a snapshot is fetched
             return Ok(());
         }
+        // A sequential block arrived — clear the initial-gap grace period.
+        // From now on, any forward gap is a real data integrity issue.
+        self.allow_initial_gap = false;
         let mut diffs = order_diffs.events().into_iter().collect::<VecDeque<_>>();
         let mut order_map = order_statuses
             .events()
