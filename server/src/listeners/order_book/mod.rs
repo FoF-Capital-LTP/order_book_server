@@ -50,6 +50,14 @@ const FS_EVENT_CHANNEL_CAP: usize = 10_000;
 /// imminent.
 const MAX_BLOCK_TIME_LAG_MS: i64 = 120_000;
 
+/// Grace period (seconds) after `init_from_snapshot` during which the lag
+/// watchdog is suppressed. After a cold start, the consumer must process
+/// a backlog of blocks from the hourly file (which may span several minutes
+/// of chain time). During this window, block_time naturally lags wall-clock.
+/// 180s is generous enough for even the largest catch-up scenarios observed
+/// (~127s in production).
+const LAG_GRACE_AFTER_INIT_SECS: u64 = 180;
+
 /// Plan E: how many times in a row the same byte offset may fail to parse
 /// while still emitting an `ERROR` log on each attempt. The first few
 /// failures are normal torn-write windows (microseconds-to-tens-of-ms while
@@ -220,10 +228,13 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 }
                 let listener = listener.lock().await;
                 // Skip the wall-clock block_time lag check while a snapshot
-                // fetch is in flight: validate_snapshot_consistency walks
-                // every coin/order pair and the consumer can legitimately
-                // stall past MAX_BLOCK_TIME_LAG_MS during that window.
-                // Without this, a slow snapshot would trip a spurious fatal.
+                // fetch is in flight. We use the AtomicBool `snapshot_in_flight`
+                // rather than `is_fetching_snapshot()` because the AtomicBool
+                // covers the FULL lifecycle including validate_snapshot_consistency
+                // (which runs after the cache is taken, outside the mutex, and
+                // can exceed 120s on a busy book). The previous is_fetching_snapshot()
+                // check was too narrow — it cleared as soon as take_cache() ran,
+                // leaving validation unprotected.
                 //
                 // Also skip when an active torn-write stall is detected
                 // (Plan E tracker shows >30s stuck at the same offset).
@@ -232,8 +243,9 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 // instantly. Without this, a torn-write lasting >120s
                 // triggers a needless fatal+restart cycle.
                 if listener.is_ready()
-                    && !listener.is_fetching_snapshot()
+                    && !snapshot_in_flight.load(AtomicOrdering::SeqCst)
                     && !listener.has_active_parse_stall()
+                    && !listener.in_init_grace_period()
                 {
                     if let Some(lag_ms) = listener.block_time_lag_ms() {
                         if lag_ms > MAX_BLOCK_TIME_LAG_MS {
@@ -343,6 +355,13 @@ pub(crate) struct OrderBookListener {
     /// arriving but consumer can't keep up" without waiting for an
     /// apply_updates fatal.
     last_block_time_ms: Option<u64>,
+    /// Wall-clock instant at which the listener became ready (first
+    /// successful `init_from_snapshot`). The lag watchdog suppresses
+    /// block_time checks for `LAG_GRACE_AFTER_INIT` seconds after this
+    /// point, giving the consumer time to catch up through the backlog
+    /// of blocks that accumulated in the hourly file before the snapshot
+    /// was taken.
+    ready_at: Option<Instant>,
     /// Diagnostic-only: when Some(path), the next successfully parsed batch
     /// from that source logs its block_number under `[hour-rollover-diag]`.
     /// Set by `on_file_creation` when opening a new hourly file, consumed by
@@ -404,6 +423,7 @@ impl OrderBookListener {
             order_diff_cache: BatchQueue::new(),
             order_status_cache: BatchQueue::new(),
             last_block_time_ms: None,
+            ready_at: None,
             pending_first_batch_log_fills: None,
             pending_first_batch_log_order_statuses: None,
             pending_first_batch_log_order_diffs: None,
@@ -455,6 +475,15 @@ impl OrderBookListener {
         Some(now_ms.saturating_sub(last_i64))
     }
 
+    /// Returns true if the listener is still within the post-init grace
+    /// period. During this window, the consumer is catching up through the
+    /// hourly file backlog and block_time will naturally lag wall-clock.
+    fn in_init_grace_period(&self) -> bool {
+        self.ready_at.map_or(false, |at| {
+            at.elapsed() < Duration::from_secs(LAG_GRACE_AFTER_INIT_SECS)
+        })
+    }
+
     /// Returns true if any source has an active torn-write stall that has
     /// lasted more than 30 seconds. Used by the lag watchdog to suppress
     /// false-positive fatals during torn-write windows: the consumer is not
@@ -479,17 +508,6 @@ impl OrderBookListener {
 
     pub(crate) const fn is_ready(&self) -> bool {
         self.order_book_state.is_some()
-    }
-
-    /// True while a snapshot fetch is in flight. The lag watchdog uses this
-    /// to skip the wall-clock block_time check, since snapshot validation
-    /// (file parse + per-coin/per-order walk in validate_snapshot_consistency)
-    /// can stall the consumer for >MAX_BLOCK_TIME_LAG_MS on a busy book
-    /// without indicating real lag. The fs_event_overflow signal stays
-    /// unconditional — that's an independent inotify-channel saturation
-    /// signal, not a consumer-stall signal.
-    pub(crate) const fn is_fetching_snapshot(&self) -> bool {
-        self.fetched_snapshot_cache.is_some()
     }
 
     pub(crate) fn universe(&self) -> HashSet<Coin> {
@@ -595,6 +613,20 @@ impl OrderBookListener {
         }
         if !retry {
             self.order_book_state = Some(new_order_book);
+            // Seed last_block_time_ms to wall-clock now. The snapshot gives us
+            // authoritative state at this moment — there is no "real" lag yet.
+            // Without this, the first parsed batch (which may have an old
+            // block_time from before the restart gap) would set last_block_time_ms
+            // to a stale value, causing the lag watchdog to immediately fire.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            self.last_block_time_ms = Some(now_ms);
+            // Record when we became ready. The lag watchdog grants a grace
+            // period after init so the consumer can catch up through the
+            // backlog without being killed.
+            self.ready_at = Some(Instant::now());
             info!("Order book ready");
         }
     }
@@ -787,6 +819,18 @@ impl DirectoryListener for OrderBookListener {
                 );
             }
             if let Err(err) = self.receive_batch(event_batch) {
+                if err.to_string().contains("[gap-grace-resync]") {
+                    // Gap detected on fresh start — state is now invalid because
+                    // we missed blocks containing New order diffs. Invalidate
+                    // state so the next periodic snapshot fetch re-initializes
+                    // cleanly. This is NOT a fatal — the system self-heals
+                    // within 60s (the snapshot fetch interval).
+                    warn!("[gap-grace-resync] invalidating state; will re-init on next snapshot fetch");
+                    self.order_book_state = None;
+                    self.last_block_time_ms = None;
+                    self.ready_at = None;
+                    return Ok(());
+                }
                 self.order_book_state = None;
                 return Err(err);
             }
@@ -856,6 +900,14 @@ impl OrderBookListener {
                     last_height_seen = Some(height);
                     lines_drained += 1;
                     if let Err(err) = self.receive_batch(event_batch) {
+                        if err.to_string().contains("[gap-grace-resync]") {
+                            warn!("[gap-grace-resync] invalidating state during stream_lines; will re-init on next snapshot fetch");
+                            self.order_book_state = None;
+                            self.last_block_time_ms = None;
+                            self.ready_at = None;
+                            // Stop draining — state is gone, remaining lines are useless
+                            break;
+                        }
                         self.order_book_state = None;
                         info!(
                             "[hour-rollover-diag] stream_lines receive_batch-error exit: source={event_source} lines_drained={lines_drained} first_height_seen={first_height_seen:?} last_height_seen={last_height_seen:?}"

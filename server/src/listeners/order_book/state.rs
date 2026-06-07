@@ -125,20 +125,21 @@ impl OrderBookState {
         if height > self.height + 1 {
             if self.allow_initial_gap {
                 // First gap after snapshot init — expected when the consumer
-                // starts at EOF of the current hour-file. The snapshot gives
-                // us authoritative state at self.height; blocks between
-                // self.height+1 and height-1 were written before we started
-                // reading and are safe to skip. Jump forward and continue.
+                // starts at EOF of the current hour-file. The skipped blocks
+                // may contain New order diffs that we need to process, so we
+                // cannot simply jump forward and continue (that causes
+                // "Unable to find order on the book" fatals on subsequent
+                // Remove diffs). Instead, signal the caller to invalidate
+                // state and re-fetch a snapshot at the current height.
                 warn!(
-                    "[fresh-start] accepting initial gap: self.height={} expected={} got={} gap_blocks={} — snapshot state is authoritative",
+                    "[fresh-start] initial gap detected: self.height={} expected={} got={} gap_blocks={} — invalidating state for snapshot re-fetch",
                     self.height,
                     self.height + 1,
                     height,
                     height.saturating_sub(self.height),
                 );
                 self.allow_initial_gap = false;
-                self.height = height - 1;
-                // Fall through to normal processing below
+                return Err("[gap-grace-resync]".into());
             } else {
                 // Diagnostic for the recurring 01:00 UTC hour-rollover fatal
                 // (see [hour-rollover-diag] elsewhere). Logs the gap shape so we
