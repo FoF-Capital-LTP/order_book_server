@@ -54,9 +54,9 @@ const MAX_BLOCK_TIME_LAG_MS: i64 = 120_000;
 /// watchdog is suppressed. After a cold start, the consumer must process
 /// a backlog of blocks from the hourly file (which may span several minutes
 /// of chain time). During this window, block_time naturally lags wall-clock.
-/// 180s is generous enough for even the largest catch-up scenarios observed
-/// (~127s in production).
-const LAG_GRACE_AFTER_INIT_SECS: u64 = 180;
+/// 300s covers the worst observed case (183s after hl-node auto-update
+/// restart on 2026-06-10, where the grace of 180s expired 3s too early).
+const LAG_GRACE_AFTER_INIT_SECS: u64 = 300;
 
 /// Plan E: how many times in a row the same byte offset may fail to parse
 /// while still emitting an `ERROR` log on each attempt. The first few
