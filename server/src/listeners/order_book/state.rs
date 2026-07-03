@@ -10,7 +10,7 @@ use crate::{
         node_data::{Batch, NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
-use log::{error, warn};
+use log::warn;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Don't re-warn about the same not-yet-grafted coin more often than this
@@ -123,6 +123,7 @@ impl OrderBookState {
         let time = order_statuses.block_time();
         assert_eq!(order_statuses.block_number(), order_diffs.block_number());
         if height > self.height + 1 {
+            let gap_blocks = height.saturating_sub(self.height);
             if self.allow_initial_gap {
                 // First gap after snapshot init — expected when the consumer
                 // starts at EOF of the current hour-file. The skipped blocks
@@ -132,31 +133,28 @@ impl OrderBookState {
                 // Remove diffs). Instead, signal the caller to invalidate
                 // state and re-fetch a snapshot at the current height.
                 warn!(
-                    "[fresh-start] initial gap detected: self.height={} expected={} got={} gap_blocks={} — invalidating state for snapshot re-fetch",
+                    "[fresh-start] initial gap detected: self.height={} expected={} got={} gap_blocks={gap_blocks} — invalidating state for snapshot re-fetch",
                     self.height,
                     self.height + 1,
                     height,
-                    height.saturating_sub(self.height),
                 );
-                self.allow_initial_gap = false;
-                return Err("[gap-grace-resync]".into());
             } else {
-                // Diagnostic for the recurring 01:00 UTC hour-rollover fatal
-                // (see [hour-rollover-diag] elsewhere). Logs the gap shape so we
-                // can tell whether this is a small drift (off-by-one race during
-                // file rotation) or a full ~one-hour jump (drain skipped / new
-                // file opens at chain tip). gap_blocks ≈ 52507 ≈ 1h*14.5 bps in
-                // the 06-01 occurrence.
-                error!(
-                    "[hour-rollover-diag] apply_updates gap detected: self.height={} expected={} got={} gap_blocks={} block_time_ms={}",
+                // Steady-state gap — typically caused by hl-node getting
+                // stuck and hl-visor restarting it. The node bootstraps from
+                // a recent round and resumes writing at a much higher block
+                // height. The local order-book state is now stale; signal the
+                // caller to invalidate and re-fetch a snapshot rather than
+                // crashing the process.
+                warn!(
+                    "[gap-resync] apply_updates gap detected: self.height={} expected={} got={} gap_blocks={gap_blocks} block_time_ms={} — invalidating state for snapshot re-fetch",
                     self.height,
                     self.height + 1,
                     height,
-                    height.saturating_sub(self.height),
                     time,
                 );
-                return Err(format!("Expecting block {}, got block {}", self.height + 1, height).into());
             }
+            self.allow_initial_gap = false;
+            return Err("[gap-grace-resync]".into());
         } else if height <= self.height {
             // This is not an error in case we started caching long before a snapshot is fetched
             return Ok(());
