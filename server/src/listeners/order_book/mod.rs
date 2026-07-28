@@ -269,7 +269,12 @@ fn fetch_snapshot(
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
-        let res = match process_rmp_file(&dir).await {
+        // Inner block so every exit path — including the early `return`s below —
+        // falls through to the `in_flight` reset. Returning straight out of the
+        // task would leave the flag stuck at `true`, permanently disabling the
+        // 60s snapshot ticker and starving the listener until BatchQueue overflows.
+        let res = async {
+            match process_rmp_file(&dir).await {
             Ok(output_fln) => {
                 let state = {
                     let mut listener = listener.lock().await;
@@ -372,10 +377,12 @@ fn fetch_snapshot(
                 }
             }
             Err(err) => Err(err),
-        };
+        }
+        }
+        .await;
         in_flight.store(false, AtomicOrdering::SeqCst);
         let _unused = tx.send(res);
-        Ok(())
+        Ok::<(), Error>(())
     });
 }
 

@@ -113,7 +113,7 @@ pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
 /// state to absorb newly-listed coins without restarting the listener.
 /// Per-order divergences and missing-on-server cases are still hard errors,
 /// because they signal real state corruption rather than a benign coin add.
-pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
+pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug + InnerOrder>(
     snapshot: &Snapshots<O>,
     expected: Snapshots<O>,
     ignore_spot: bool,
@@ -127,13 +127,43 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
         }
         let book1 = book.as_ref();
         if let Some(book2) = snapshot_map.remove(coin) {
+            // Compare by oid, not by position. Within a price level the order
+            // of equal-priced entries reflects insertion timing, so a positional
+            // zip reports a mismatch for any snapshot taken a few blocks apart
+            // even when both books hold exactly the same orders.
             for (orders1, orders2) in book1.as_ref().iter().zip(book2.as_ref()) {
-                for (order1, order2) in orders1.iter().zip(orders2.iter()) {
-                    if *order1 != *order2 {
-                        return Err(
-                            format!("Orders do not match, expected: {:?} received: {:?}", *order2, *order1).into()
-                        );
+                let expected_by_oid: HashMap<_, _> = orders2.iter().map(|o| (o.oid(), o)).collect();
+                for order1 in orders1 {
+                    match expected_by_oid.get(&order1.oid()) {
+                        Some(order2) if *order1 == **order2 => {}
+                        Some(order2) => {
+                            return Err(format!(
+                                "Order {:?} does not match, expected: {:?} received: {:?}",
+                                order1.oid(),
+                                *order2,
+                                order1
+                            )
+                            .into());
+                        }
+                        None => {
+                            return Err(format!(
+                                "Order {:?} present locally but missing from fetched {} snapshot: {:?}",
+                                order1.oid(),
+                                coin.value(),
+                                order1
+                            )
+                            .into());
+                        }
                     }
+                }
+                if orders1.len() != orders2.len() {
+                    return Err(format!(
+                        "{} book side size mismatch: local {} orders, fetched {} orders",
+                        coin.value(),
+                        orders1.len(),
+                        orders2.len()
+                    )
+                    .into());
                 }
             }
         } else if !book1[0].is_empty() || !book1[1].is_empty() {
