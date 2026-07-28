@@ -240,4 +240,9 @@ impl<T> BatchQueue<T> {
     pub(super) fn front(&self) -> Option<&Batch<T>> {
         self.deque.front()
     }
+
+    pub(super) fn clear(&mut self) {
+        self.deque.clear();
+        self.last_ts = None;
+    }
 }

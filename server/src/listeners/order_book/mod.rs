@@ -871,6 +871,10 @@ impl DirectoryListener for OrderBookListener {
                     self.order_book_state = None;
                     self.last_block_time_ms = None;
                     self.ready_at = None;
+                    // Clear batch queues to prevent BatchQueue overflow while
+                    // waiting for the next snapshot fetch to re-initialize state.
+                    self.order_status_cache.clear();
+                    self.order_diff_cache.clear();
                     return Ok(());
                 }
                 self.order_book_state = None;
@@ -947,6 +951,8 @@ impl OrderBookListener {
                             self.order_book_state = None;
                             self.last_block_time_ms = None;
                             self.ready_at = None;
+                            self.order_status_cache.clear();
+                            self.order_diff_cache.clear();
                             // Stop draining — state is gone, remaining lines are useless
                             break;
                         }
