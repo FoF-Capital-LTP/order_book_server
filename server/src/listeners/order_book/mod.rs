@@ -92,6 +92,33 @@ use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consiste
 mod state;
 mod utils;
 
+/// What the lag watchdog should do with one lag sample.
+#[derive(Debug, PartialEq, Eq)]
+enum LagVerdict {
+    /// Lag is within bounds.
+    Ok,
+    /// Over the ceiling but shrinking — hl-node is replaying an upstream hole
+    /// and the consumer is winning. Carries the new deferral count.
+    DeferCatchup(u32),
+    /// Over the ceiling and not making progress (or out of deferrals).
+    Fatal { shrinking: bool, deferrals: u32 },
+}
+
+/// Pure decision for the lag watchdog, split out so the state machine is
+/// testable without a running listener. `prev_lag_ms` is the previous
+/// *checkable* tick's sample, or None if the last tick was skipped.
+fn lag_verdict(lag_ms: i64, prev_lag_ms: Option<i64>, deferrals: u32) -> LagVerdict {
+    if lag_ms <= MAX_BLOCK_TIME_LAG_MS {
+        return LagVerdict::Ok;
+    }
+    let shrinking = prev_lag_ms.is_some_and(|prev| prev - lag_ms >= CATCHUP_MIN_SHRINK_MS);
+    if shrinking && deferrals < MAX_CATCHUP_DEFERRALS {
+        LagVerdict::DeferCatchup(deferrals + 1)
+    } else {
+        LagVerdict::Fatal { shrinking, deferrals }
+    }
+}
+
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
 // if there are scripts running, this may not work as intended
 pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: PathBuf) -> Result<()> {
@@ -281,29 +308,24 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                         // then is pure collateral: it is not starved, it is
                         // draining a backlog that only it can drain.
                         //
-                        // "Starved" and "catching up" are distinguished by the
-                        // SIGN of the lag derivative, not its magnitude:
-                        //   shrinking => the consumer is winning; wait.
-                        //   flat/growing => genuinely wedged; die.
-                        // Bounded by MAX_CATCHUP_DEFERRALS so a pathological
-                        // "shrinks 1ms per tick forever" case still terminates.
-                        let shrinking = prev_lag_ms
-                            .is_some_and(|prev| prev - lag_ms >= CATCHUP_MIN_SHRINK_MS);
+                        // "Starved" vs "catching up" is decided by the SIGN of
+                        // the lag derivative, not its magnitude. See
+                        // `lag_verdict` and its tests.
+                        let verdict = lag_verdict(lag_ms, prev_lag_ms, catchup_deferrals);
                         prev_lag_ms = Some(lag_ms);
-
-                        if lag_ms > MAX_BLOCK_TIME_LAG_MS {
-                            if shrinking && catchup_deferrals < MAX_CATCHUP_DEFERRALS {
-                                catchup_deferrals += 1;
+                        match verdict {
+                            LagVerdict::Ok => catchup_deferrals = 0,
+                            LagVerdict::DeferCatchup(n) => {
+                                catchup_deferrals = n;
                                 warn!(
-                                    "[lag-catchup] block_time lag {lag_ms} ms exceeds {MAX_BLOCK_TIME_LAG_MS} ms but is shrinking; deferring fatal ({catchup_deferrals}/{MAX_CATCHUP_DEFERRALS})"
+                                    "[lag-catchup] block_time lag {lag_ms} ms exceeds {MAX_BLOCK_TIME_LAG_MS} ms but is shrinking; deferring fatal ({n}/{MAX_CATCHUP_DEFERRALS})"
                                 );
-                            } else {
+                            }
+                            LagVerdict::Fatal { shrinking, deferrals } => {
                                 return Err(format!(
-                                    "Listener block_time lag {lag_ms} ms exceeds {MAX_BLOCK_TIME_LAG_MS} ms — consumer is starved (shrinking={shrinking}, deferrals={catchup_deferrals})"
+                                    "Listener block_time lag {lag_ms} ms exceeds {MAX_BLOCK_TIME_LAG_MS} ms — consumer is starved (shrinking={shrinking}, deferrals={deferrals})"
                                 ).into());
                             }
-                        } else {
-                            catchup_deferrals = 0;
                         }
                     }
                 }
@@ -1088,4 +1110,105 @@ pub(crate) enum InternalMessage {
 pub(crate) struct L2SnapshotParams {
     n_sig_figs: Option<u32>,
     mantissa: Option<u64>,
+}
+
+#[cfg(test)]
+mod lag_watchdog_tests {
+    use super::*;
+
+    const OVER: i64 = MAX_BLOCK_TIME_LAG_MS + 60_000;
+
+    #[test]
+    fn under_ceiling_is_ok_and_resets_deferrals() {
+        assert_eq!(lag_verdict(MAX_BLOCK_TIME_LAG_MS, Some(OVER), 7), LagVerdict::Ok);
+    }
+
+    #[test]
+    fn over_ceiling_and_shrinking_defers() {
+        // 300s -> 240s: hl-node is replaying, consumer is winning.
+        assert_eq!(lag_verdict(240_000, Some(300_000), 0), LagVerdict::DeferCatchup(1));
+    }
+
+    #[test]
+    fn over_ceiling_and_growing_is_fatal() {
+        // Genuine starvation: lag climbing. Must NOT be exempted.
+        assert_eq!(
+            lag_verdict(300_000, Some(240_000), 0),
+            LagVerdict::Fatal { shrinking: false, deferrals: 0 }
+        );
+    }
+
+    #[test]
+    fn over_ceiling_and_flat_is_fatal() {
+        // A wedged consumer holds lag constant — the case the watchdog exists for.
+        assert_eq!(
+            lag_verdict(300_000, Some(300_000), 0),
+            LagVerdict::Fatal { shrinking: false, deferrals: 0 }
+        );
+    }
+
+    #[test]
+    fn jitter_sized_shrink_does_not_count_as_catchup() {
+        // Below CATCHUP_MIN_SHRINK_MS: noise, not progress.
+        assert_eq!(
+            lag_verdict(300_000, Some(300_000 + CATCHUP_MIN_SHRINK_MS - 1), 0),
+            LagVerdict::Fatal { shrinking: false, deferrals: 0 }
+        );
+    }
+
+    #[test]
+    fn no_previous_sample_is_fatal_not_exempt() {
+        // First checkable tick after a skip must fail closed, never assume progress.
+        assert_eq!(
+            lag_verdict(OVER, None, 0),
+            LagVerdict::Fatal { shrinking: false, deferrals: 0 }
+        );
+    }
+
+    #[test]
+    fn deferrals_are_bounded() {
+        // At the cap, even genuine shrinking must die — bounds the exemption.
+        assert_eq!(
+            lag_verdict(240_000, Some(300_000), MAX_CATCHUP_DEFERRALS),
+            LagVerdict::Fatal { shrinking: true, deferrals: MAX_CATCHUP_DEFERRALS }
+        );
+        assert_eq!(
+            lag_verdict(240_000, Some(300_000), MAX_CATCHUP_DEFERRALS - 1),
+            LagVerdict::DeferCatchup(MAX_CATCHUP_DEFERRALS)
+        );
+    }
+
+    #[test]
+    fn slow_shrink_cannot_defer_forever() {
+        // Pathological: shrinks just enough each tick. Must still terminate.
+        let mut lag = 10_000_000i64;
+        let mut deferrals = 0u32;
+        let mut prev = None;
+        for _ in 0..(MAX_CATCHUP_DEFERRALS + 5) {
+            match lag_verdict(lag, prev, deferrals) {
+                LagVerdict::DeferCatchup(n) => deferrals = n,
+                LagVerdict::Fatal { .. } => {
+                    assert_eq!(deferrals, MAX_CATCHUP_DEFERRALS, "must die at the cap");
+                    return;
+                }
+                LagVerdict::Ok => panic!("lag never dropped under ceiling"),
+            }
+            prev = Some(lag);
+            lag -= CATCHUP_MIN_SHRINK_MS;
+        }
+        panic!("exemption never terminated — unbounded deferral");
+    }
+
+    #[test]
+    fn recovery_below_ceiling_clears_state_for_next_stall() {
+        // Deferrals accumulate, lag recovers, then a NEW genuine stall must
+        // get a full fatal decision rather than inheriting a spent budget.
+        assert_eq!(lag_verdict(240_000, Some(300_000), 0), LagVerdict::DeferCatchup(1));
+        assert_eq!(lag_verdict(50_000, Some(240_000), 1), LagVerdict::Ok);
+        // caller resets deferrals to 0 on Ok; a later flat-high lag is fatal
+        assert_eq!(
+            lag_verdict(300_000, Some(300_000), 0),
+            LagVerdict::Fatal { shrinking: false, deferrals: 0 }
+        );
+    }
 }
