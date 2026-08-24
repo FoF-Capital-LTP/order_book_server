@@ -58,6 +58,20 @@ const MAX_BLOCK_TIME_LAG_MS: i64 = 120_000;
 /// restart on 2026-06-10, where the grace of 180s expired 3s too early).
 const LAG_GRACE_AFTER_INIT_SECS: u64 = 300;
 
+/// Minimum per-tick shrink (ms) in block_time lag that counts as genuine
+/// catch-up rather than jitter. block_time advances in ~7.5 s chain steps, so
+/// anything at or below one step is noise.
+const CATCHUP_MIN_SHRINK_MS: i64 = 1_000;
+
+/// Hard cap on consecutive watchdog ticks the lag check may be deferred for
+/// catch-up. Bounds the blast radius of the exemption: at
+/// `WATCHDOG_INTERVAL_SECS` = 15 s this is ~10 min, enough to drain the worst
+/// observed upstream stall (08-21: 420 s hole took ~9 min to replay) while
+/// guaranteeing a genuinely wedged consumer still dies. A lag that oscillates
+/// instead of shrinking never accumulates deferrals in the first place, since
+/// each tick must show real forward progress.
+const MAX_CATCHUP_DEFERRALS: u32 = 40;
+
 /// Plan E: how many times in a row the same byte offset may fail to parse
 /// while still emitting an `ERROR` log on each attempt. The first few
 /// failures are normal torn-write windows (microseconds-to-tens-of-ms while
@@ -136,6 +150,11 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     // we don't share fate with `sleep` (which gets reset by every fs event).
     let lag_start = Instant::now() + Duration::from_secs(WATCHDOG_INTERVAL_SECS);
     let mut lag_ticker = interval_at(lag_start, Duration::from_secs(WATCHDOG_INTERVAL_SECS));
+    // Previous tick's lag, and how many consecutive ticks we've deferred the
+    // fatal because lag was actively shrinking. See the catch-up exemption in
+    // the lag watchdog arm below.
+    let mut prev_lag_ms: Option<i64> = None;
+    let mut catchup_deferrals: u32 = 0;
     loop {
         tokio::select! {
             event = fs_event_rx.recv() =>  match event {
@@ -242,16 +261,49 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 // flush an incomplete line. Once flushed, lag recovers
                 // instantly. Without this, a torn-write lasting >120s
                 // triggers a needless fatal+restart cycle.
-                if listener.is_ready()
+                let checkable = listener.is_ready()
                     && !snapshot_in_flight.load(AtomicOrdering::SeqCst)
                     && !listener.has_active_parse_stall()
-                    && !listener.in_init_grace_period()
-                {
+                    && !listener.in_init_grace_period();
+                if !checkable {
+                    // Drop the stale sample so the next checkable tick cannot
+                    // diff against a long-expired lag and mistake the interval
+                    // for catch-up progress.
+                    prev_lag_ms = None;
+                    catchup_deferrals = 0;
+                }
+                if checkable {
                     if let Some(lag_ms) = listener.block_time_lag_ms() {
+                        // Catch-up exemption. After an UPSTREAM stall (hl-node
+                        // stops producing because a peer served stale blocks —
+                        // see 2026-08-21) lag legitimately exceeds the ceiling
+                        // while hl-node replays the hole. Killing the consumer
+                        // then is pure collateral: it is not starved, it is
+                        // draining a backlog that only it can drain.
+                        //
+                        // "Starved" and "catching up" are distinguished by the
+                        // SIGN of the lag derivative, not its magnitude:
+                        //   shrinking => the consumer is winning; wait.
+                        //   flat/growing => genuinely wedged; die.
+                        // Bounded by MAX_CATCHUP_DEFERRALS so a pathological
+                        // "shrinks 1ms per tick forever" case still terminates.
+                        let shrinking = prev_lag_ms
+                            .is_some_and(|prev| prev - lag_ms >= CATCHUP_MIN_SHRINK_MS);
+                        prev_lag_ms = Some(lag_ms);
+
                         if lag_ms > MAX_BLOCK_TIME_LAG_MS {
-                            return Err(format!(
-                                "Listener block_time lag {lag_ms} ms exceeds {MAX_BLOCK_TIME_LAG_MS} ms — consumer is starved"
-                            ).into());
+                            if shrinking && catchup_deferrals < MAX_CATCHUP_DEFERRALS {
+                                catchup_deferrals += 1;
+                                warn!(
+                                    "[lag-catchup] block_time lag {lag_ms} ms exceeds {MAX_BLOCK_TIME_LAG_MS} ms but is shrinking; deferring fatal ({catchup_deferrals}/{MAX_CATCHUP_DEFERRALS})"
+                                );
+                            } else {
+                                return Err(format!(
+                                    "Listener block_time lag {lag_ms} ms exceeds {MAX_BLOCK_TIME_LAG_MS} ms — consumer is starved (shrinking={shrinking}, deferrals={catchup_deferrals})"
+                                ).into());
+                            }
+                        } else {
+                            catchup_deferrals = 0;
                         }
                     }
                 }
