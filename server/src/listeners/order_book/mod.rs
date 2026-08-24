@@ -1183,7 +1183,10 @@ mod lag_watchdog_tests {
         // Pathological: shrinks just enough each tick. Must still terminate.
         let mut lag = 10_000_000i64;
         let mut deferrals = 0u32;
-        let mut prev = None;
+        // Seed a prior sample: without one the first tick fails closed (see
+        // `no_previous_sample_is_fatal_not_exempt`), which is correct but is
+        // not the unbounded-deferral case under test here.
+        let mut prev = Some(lag + CATCHUP_MIN_SHRINK_MS);
         for _ in 0..(MAX_CATCHUP_DEFERRALS + 5) {
             match lag_verdict(lag, prev, deferrals) {
                 LagVerdict::DeferCatchup(n) => deferrals = n,
