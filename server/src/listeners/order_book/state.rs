@@ -14,7 +14,10 @@ use log::warn;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 /// Don't re-warn about the same not-yet-grafted coin more often than this
@@ -22,6 +25,9 @@ use std::{
 /// readable when a high-activity new coin appears between snapshot fetches
 /// (default fetch interval is 60 s).
 const NOT_YET_GRAFTED_WARN_THROTTLE_BLOCKS: u64 = 200;
+
+/// New diffs whose insertBefore anchor was not resting at the order's level.
+static INSERT_BEFORE_MISSES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub(super) struct OrderBookState {
@@ -230,7 +236,7 @@ impl OrderBookState {
             }
             let inner_diff = diff.diff().try_into()?;
             match inner_diff {
-                InnerOrderDiff::New { sz } => {
+                InnerOrderDiff::New { sz, insert_before } => {
                     if let Some(order) = order_map.remove(&oid) {
                         let time = order.time.and_utc().timestamp_millis();
                         let mut inner_order: InnerL4Order = order.clone().try_into()?;
@@ -243,7 +249,14 @@ impl OrderBookState {
                         // the order rests at is on the diff event itself. For ordinary limit
                         // orders the two are equal, so this is a no-op there.
                         inner_order.limit_px = Px::parse_from_str(diff.px())?;
-                        self.order_book.add_order(inner_order);
+                        // A missing insertBefore anchor only misplaces the order within its
+                        // level (sizes and L2 stay right), so warn rather than fail the listener.
+                        if !self.order_book.add_order_before(inner_order, insert_before) {
+                            let misses = INSERT_BEFORE_MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+                            if misses.is_power_of_two() {
+                                warn!("insertBefore anchor not on the book, rested at the back of its level ({misses} so far) {diff:?}");
+                            }
+                        }
                     } else {
                         return Err(format!("Unable to find order opening status {diff:?}").into());
                     }
@@ -298,7 +311,7 @@ mod real_snapshot_test {
     use crate::{
         listeners::order_book::utils::{compute_coin_l2_snapshots_full_depth, compute_l2_snapshots},
         order_book::multi_book::load_snapshots_from_str,
-        types::{L4Order, inner::InnerLevel, subscription::MAX_LEVELS},
+        types::{L4Order, OrderDiff, inner::InnerLevel, subscription::MAX_LEVELS},
     };
     use alloy::primitives::Address;
     use std::time::{Duration, Instant};
@@ -330,6 +343,7 @@ mod real_snapshot_test {
         let mut prev: HashMap<Coin, Arc<CoinL2Snapshots>> = first.as_ref().clone();
         let n_coins = prev.len();
         let (mut n_blocks, mut n_recomputed, mut incr_time, mut full_time) = (0, 0, Duration::ZERO, Duration::ZERO);
+        let (mut n_insert_before, mut n_ahead_checked) = (0, 0);
         let mut lines = blocks.lines();
         while let (Some(statuses), Some(diffs)) = (lines.next(), lines.next()) {
             let statuses: Batch<NodeDataOrderStatus> = serde_json::from_str(statuses).unwrap();
@@ -337,6 +351,21 @@ mod real_snapshot_test {
             assert_eq!(statuses.block_number(), state.height + 1);
             state.apply_updates(&statuses, &diffs).unwrap();
             n_blocks += 1;
+
+            // An insertBefore order must queue ahead of its anchor while both still rest.
+            let mut books = HashMap::new();
+            for diff in diffs.events_ref() {
+                let OrderDiff::New { insert_before: Some(anchor), .. } = diff.diff() else { continue };
+                n_insert_before += 1;
+                let coin = diff.coin();
+                let snapshot = books.entry(coin.clone()).or_insert_with(|| state.compute_coin_snapshot(&coin).unwrap().2);
+                let queue = snapshot.as_ref().iter().flatten().map(InnerOrder::oid).collect::<Vec<_>>();
+                let pos = |oid: &Oid| queue.iter().position(|o| o == oid);
+                if let (Some(order), Some(anchor)) = (pos(&diff.oid()), pos(&Oid::new(anchor))) {
+                    assert!(order < anchor, "block {} {diff:?} queued behind its anchor", state.height);
+                    n_ahead_checked += 1;
+                }
+            }
             if n_blocks == 200 {
                 // A newly-listed coin grafted mid-stream, and an existing book replaced.
                 let btc = state.compute_coin_snapshot(&Coin::new("BTC")).unwrap().2;
@@ -385,12 +414,42 @@ mod real_snapshot_test {
             }
         }
         assert_eq!(n_blocks, 400, "fixture should hold 400 blocks");
+        assert_eq!(INSERT_BEFORE_MISSES.load(Ordering::Relaxed), 0, "every insertBefore anchor should be on the book");
+        assert!(n_ahead_checked > 0);
+        eprintln!("{n_insert_before} insertBefore diffs, {n_ahead_checked} checked queued ahead of their anchor");
         eprintln!(
             "{n_blocks} blocks, {n_coins} coins: {:.1} coins recomputed per block; l2 incremental {:?}/block vs full {:?}/block",
             n_recomputed as f64 / f64::from(n_blocks),
             incr_time / n_blocks,
             full_time / n_blocks,
         );
+    }
+
+    /// Validation reports queue-order differences, so a book built from a node snapshot must
+    /// hand back every level in the node's queue order.
+    #[test]
+    fn node_snapshot_queue_order_round_trips() {
+        let Ok(json) = fs::read_to_string(FIXTURE) else {
+            eprintln!("skipping: {FIXTURE} not present");
+            return;
+        };
+        let load = || load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json).unwrap();
+        let ((height, snapshot), (_, expected)) = (load(), load());
+        drop(json);
+        let state = OrderBookState::from_snapshot(snapshot, height, 0, true, false);
+        let local = state.compute_snapshot();
+        let (mut n_sides, mut n_misordered) = (0, 0);
+        for (coin, mut expected) in expected.value() {
+            expected.remove_triggers();
+            for (got, expected) in local.as_ref()[&coin].as_ref().iter().zip(expected.as_ref()) {
+                n_sides += 1;
+                if !got.iter().map(InnerOrder::oid).eq(expected.iter().map(InnerOrder::oid)) {
+                    n_misordered += 1;
+                }
+            }
+        }
+        assert!(n_sides > 200);
+        assert_eq!(n_misordered, 0, "of {n_sides} book sides");
     }
 
     #[test]

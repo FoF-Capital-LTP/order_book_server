@@ -26,7 +26,7 @@ The `l4book` subscription first sends a snapshot of the entire book and then for
 
 ## Setup
 
-1. Run a non-validating node (from [`hyperliquid-dex/node`](https://github.com/hyperliquid-dex/node)). Requires batching by block. Requires recording fills, order statuses, and raw book diffs.
+1. Run a non-validating node (from [`hyperliquid-dex/node`](https://github.com/hyperliquid-dex/node)). Requires batching by block. Requires recording fills, order statuses, and raw book diffs. Requires handling info requests. 
 
 2. Then run this local server:
 

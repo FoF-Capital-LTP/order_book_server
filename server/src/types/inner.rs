@@ -187,6 +187,7 @@ impl From<InnerLevel> for Level {
 pub(crate) enum InnerOrderDiff {
     New {
         sz: Sz,
+        insert_before: Option<Oid>,
     },
     #[allow(dead_code)]
     Update {
@@ -201,7 +202,9 @@ impl TryFrom<OrderDiff> for InnerOrderDiff {
 
     fn try_from(value: OrderDiff) -> Result<Self> {
         Ok(match value {
-            OrderDiff::New { sz } => Self::New { sz: Sz::parse_from_str(&sz)? },
+            OrderDiff::New { sz, insert_before } => {
+                Self::New { sz: Sz::parse_from_str(&sz)?, insert_before: insert_before.map(Oid::new) }
+            }
             OrderDiff::Update { orig_sz, new_sz } => {
                 Self::Update { orig_sz: Sz::parse_from_str(&orig_sz)?, new_sz: Sz::parse_from_str(&new_sz)? }
             }

@@ -62,10 +62,11 @@ impl<O: InnerOrder> OrderBooks<O> {
         std::mem::take(&mut self.changed)
     }
 
-    pub(crate) fn add_order(&mut self, order: O) {
+    // Returns false when `insert_before` cannot be honored; see OrderBook::add_order_before.
+    pub(crate) fn add_order_before(&mut self, order: O, insert_before: Option<Oid>) -> bool {
         let coin = &order.coin();
         self.mark_changed(coin);
-        self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).add_order(order);
+        self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).add_order_before(order, insert_before)
     }
 
     /// Graft a fetched snapshot for a new coin into this multi-book.

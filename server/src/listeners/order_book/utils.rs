@@ -120,16 +120,16 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug + Inner
     let mut snapshot_map: HashMap<_, _> =
         expected.value().into_iter().filter(|(c, _)| !c.is_spot() || !ignore_spot).collect();
 
+    let mut misordered = Vec::new();
     for (coin, book) in snapshot.as_ref() {
         if ignore_spot && coin.is_spot() {
             continue;
         }
         let book1 = book.as_ref();
         if let Some(book2) = snapshot_map.remove(coin) {
-            // Compare by oid, not by position. Within a price level the order
-            // of equal-priced entries reflects insertion timing, so a positional
-            // zip reports a mismatch for any snapshot taken a few blocks apart
-            // even when both books hold exactly the same orders.
+            // Compare by oid first; queue order within a level is only reported
+            // below. Both snapshots are at the same height, so once insertBefore
+            // is honored a queue-order difference means the local book diverged.
             for (orders1, orders2) in book1.as_ref().iter().zip(book2.as_ref()) {
                 let expected_by_oid: HashMap<_, _> = orders2.iter().map(|o| (o.oid(), o)).collect();
                 for order1 in orders1 {
@@ -164,10 +164,21 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug + Inner
                     )
                     .into());
                 }
+                if !orders1.iter().map(InnerOrder::oid).eq(orders2.iter().map(InnerOrder::oid)) {
+                    misordered.push(coin.value());
+                }
             }
         } else if !book1[0].is_empty() || !book1[1].is_empty() {
             return Err(format!("Missing {} book", coin.value()).into());
         }
+    }
+    if !misordered.is_empty() {
+        misordered.sort();
+        warn!(
+            "[snapshot-queue-order] {} book side(s) hold the same orders in a different queue order: {:?}",
+            misordered.len(),
+            misordered.iter().take(20).collect::<Vec<_>>()
+        );
     }
     // Remaining entries in snapshot_map are "extra" books in the authoritative
     // snapshot — typically newly-listed coins. Return them so the caller can
