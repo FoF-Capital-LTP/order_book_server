@@ -1,4 +1,6 @@
 use crate::{
+    servers::websocket_server::SnapshotShared,
+    latency,
     listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
     order_book::{
         Coin, Snapshot,
@@ -58,20 +60,6 @@ const MAX_BLOCK_TIME_LAG_MS: i64 = 120_000;
 /// restart on 2026-06-10, where the grace of 180s expired 3s too early).
 const LAG_GRACE_AFTER_INIT_SECS: u64 = 300;
 
-/// Minimum per-tick shrink (ms) in block_time lag that counts as genuine
-/// catch-up rather than jitter. block_time advances in ~7.5 s chain steps, so
-/// anything at or below one step is noise.
-const CATCHUP_MIN_SHRINK_MS: i64 = 1_000;
-
-/// Hard cap on consecutive watchdog ticks the lag check may be deferred for
-/// catch-up. Bounds the blast radius of the exemption: at
-/// `WATCHDOG_INTERVAL_SECS` = 15 s this is ~10 min, enough to drain the worst
-/// observed upstream stall (08-21: 420 s hole took ~9 min to replay) while
-/// guaranteeing a genuinely wedged consumer still dies. A lag that oscillates
-/// instead of shrinking never accumulates deferrals in the first place, since
-/// each tick must show real forward progress.
-const MAX_CATCHUP_DEFERRALS: u32 = 40;
-
 /// Plan E: how many times in a row the same byte offset may fail to parse
 /// while still emitting an `ERROR` log on each attempt. The first few
 /// failures are normal torn-write windows (microseconds-to-tens-of-ms while
@@ -88,39 +76,34 @@ const PARSE_FAIL_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the lag watchdog runs. Independent of fs activity.
 const WATCHDOG_INTERVAL_SECS: u64 = 15;
 use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
+#[cfg(test)]
+pub(crate) use utils::compute_l2_snapshots;
 
 mod state;
 mod utils;
 
-/// What the lag watchdog should do with one lag sample.
-#[derive(Debug, PartialEq, Eq)]
-enum LagVerdict {
-    /// Lag is within bounds.
-    Ok,
-    /// Over the ceiling but shrinking — hl-node is replaying an upstream hole
-    /// and the consumer is winning. Carries the new deferral count.
-    DeferCatchup(u32),
-    /// Over the ceiling and not making progress (or out of deferrals).
-    Fatal { shrinking: bool, deferrals: u32 },
-}
-
-/// Pure decision for the lag watchdog, split out so the state machine is
-/// testable without a running listener. `prev_lag_ms` is the previous
-/// *checkable* tick's sample, or None if the last tick was skipped.
-fn lag_verdict(lag_ms: i64, prev_lag_ms: Option<i64>, deferrals: u32) -> LagVerdict {
-    if lag_ms <= MAX_BLOCK_TIME_LAG_MS {
-        return LagVerdict::Ok;
-    }
-    let shrinking = prev_lag_ms.is_some_and(|prev| prev - lag_ms >= CATCHUP_MIN_SHRINK_MS);
-    if shrinking && deferrals < MAX_CATCHUP_DEFERRALS {
-        LagVerdict::DeferCatchup(deferrals + 1)
-    } else {
-        LagVerdict::Fatal { shrinking, deferrals }
-    }
-}
-
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
 // if there are scripts running, this may not work as intended
+/// Handles one fs event under the listener mutex, recording lock wait and hold times.
+async fn process_update_timed(
+    listener: &Mutex<OrderBookListener>,
+    event: &Event,
+    new_path: &PathBuf,
+    event_source: EventSource,
+) -> Result<()> {
+    let wait_start = Instant::now();
+    let mut listener = listener.lock().await;
+    let hold_start = Instant::now();
+    latency::LOCK_WAIT_US.record_duration_us(hold_start - wait_start);
+    // Parsing, applying and compute_l2_snapshots are synchronous and take
+    // milliseconds; block_in_place hands this worker's queued tasks (incl. the
+    // LIFO slot, which other workers cannot steal) to another thread meanwhile,
+    // so client tasks woken by the broadcasts are not stuck behind us.
+    let res = tokio::task::block_in_place(|| listener.process_update(event, new_path, event_source));
+    latency::LOCK_HOLD_US.record_duration_us(hold_start.elapsed());
+    res
+}
+
 pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: PathBuf) -> Result<()> {
     let order_statuses_dir = EventSource::OrderStatuses.event_source_dir(&dir).canonicalize()?;
     let fills_dir = EventSource::Fills.event_source_dir(&dir).canonicalize()?;
@@ -177,11 +160,6 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     // we don't share fate with `sleep` (which gets reset by every fs event).
     let lag_start = Instant::now() + Duration::from_secs(WATCHDOG_INTERVAL_SECS);
     let mut lag_ticker = interval_at(lag_start, Duration::from_secs(WATCHDOG_INTERVAL_SECS));
-    // Previous tick's lag, and how many consecutive ticks we've deferred the
-    // fatal because lag was actively shrinking. See the catch-up exemption in
-    // the lag watchdog arm below.
-    let mut prev_lag_ms: Option<i64> = None;
-    let mut catchup_deferrals: u32 = 0;
     loop {
         tokio::select! {
             event = fs_event_rx.recv() =>  match event {
@@ -189,22 +167,16 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                     if event.kind.is_create() || event.kind.is_modify() {
                         let new_path = &event.paths[0];
                         if new_path.starts_with(&order_statuses_dir) && new_path.is_file() {
-                            listener
-                                .lock()
+                            process_update_timed(&listener, &event, new_path, EventSource::OrderStatuses)
                                 .await
-                                .process_update(&event, new_path, EventSource::OrderStatuses)
                                 .map_err(|err| format!("Order status processing error: {err}"))?;
                         } else if new_path.starts_with(&fills_dir) && new_path.is_file() {
-                            listener
-                                .lock()
+                            process_update_timed(&listener, &event, new_path, EventSource::Fills)
                                 .await
-                                .process_update(&event, new_path, EventSource::Fills)
                                 .map_err(|err| format!("Fill update processing error: {err}"))?;
                         } else if new_path.starts_with(&order_diffs_dir) && new_path.is_file() {
-                            listener
-                                .lock()
+                            process_update_timed(&listener, &event, new_path, EventSource::OrderDiffs)
                                 .await
-                                .process_update(&event, new_path, EventSource::OrderDiffs)
                                 .map_err(|err| format!("Book diff processing error: {err}"))?;
                         }
                     }
@@ -292,40 +264,12 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                     && !snapshot_in_flight.load(AtomicOrdering::SeqCst)
                     && !listener.has_active_parse_stall()
                     && !listener.in_init_grace_period();
-                if !checkable {
-                    // Drop the stale sample so the next checkable tick cannot
-                    // diff against a long-expired lag and mistake the interval
-                    // for catch-up progress.
-                    prev_lag_ms = None;
-                    catchup_deferrals = 0;
-                }
                 if checkable {
                     if let Some(lag_ms) = listener.block_time_lag_ms() {
-                        // Catch-up exemption. After an UPSTREAM stall (hl-node
-                        // stops producing because a peer served stale blocks —
-                        // see 2026-08-21) lag legitimately exceeds the ceiling
-                        // while hl-node replays the hole. Killing the consumer
-                        // then is pure collateral: it is not starved, it is
-                        // draining a backlog that only it can drain.
-                        //
-                        // "Starved" vs "catching up" is decided by the SIGN of
-                        // the lag derivative, not its magnitude. See
-                        // `lag_verdict` and its tests.
-                        let verdict = lag_verdict(lag_ms, prev_lag_ms, catchup_deferrals);
-                        prev_lag_ms = Some(lag_ms);
-                        match verdict {
-                            LagVerdict::Ok => catchup_deferrals = 0,
-                            LagVerdict::DeferCatchup(n) => {
-                                catchup_deferrals = n;
-                                warn!(
-                                    "[lag-catchup] block_time lag {lag_ms} ms exceeds {MAX_BLOCK_TIME_LAG_MS} ms but is shrinking; deferring fatal ({n}/{MAX_CATCHUP_DEFERRALS})"
-                                );
-                            }
-                            LagVerdict::Fatal { shrinking, deferrals } => {
-                                return Err(format!(
-                                    "Listener block_time lag {lag_ms} ms exceeds {MAX_BLOCK_TIME_LAG_MS} ms — consumer is starved (shrinking={shrinking}, deferrals={deferrals})"
-                                ).into());
-                            }
+                        if lag_ms > MAX_BLOCK_TIME_LAG_MS {
+                            return Err(format!(
+                                "Listener block_time lag {lag_ms} ms exceeds {MAX_BLOCK_TIME_LAG_MS} ms — consumer is starved"
+                            ).into());
                         }
                     }
                 }
@@ -353,7 +297,10 @@ fn fetch_snapshot(
                 let state = {
                     let mut listener = listener.lock().await;
                     listener.begin_caching();
-                    listener.clone_state()
+                    let start = Instant::now();
+                    let state = tokio::task::block_in_place(|| listener.clone_state());
+                    latency::SNAPSHOT_CLONE_US.record_duration_us(start.elapsed());
+                    state
                 };
                 let snapshot = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&output_fln).await;
                 info!("Snapshot fetched");
@@ -407,7 +354,7 @@ fn fetch_snapshot(
                                 );
                                 return Ok::<(), Error>(());
                             }
-                            let stored_snapshot = state.compute_snapshot().snapshot;
+                            let stored_snapshot = state.compute_snapshot();
                             info!("Validating snapshot");
                             match validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot) {
                                 Ok(extras) if extras.is_empty() => Ok(()),
@@ -502,6 +449,9 @@ pub(crate) struct OrderBookListener {
     parse_fail_fills: ParseFailureTracker,
     parse_fail_order_statuses: ParseFailureTracker,
     parse_fail_order_diffs: ParseFailureTracker,
+    /// hl-node local_time (µs) of the last applied block; stamped on L2
+    /// snapshot messages so client tasks can measure delivery latency.
+    last_applied_local_time_us: u64,
 }
 
 /// Plan E: tracks "stuck on the same byte offset" state for a single
@@ -553,6 +503,7 @@ impl OrderBookListener {
             parse_fail_fills: ParseFailureTracker::default(),
             parse_fail_order_statuses: ParseFailureTracker::default(),
             parse_fail_order_diffs: ParseFailureTracker::default(),
+            last_applied_local_time_us: 0,
         }
     }
 
@@ -625,8 +576,11 @@ impl OrderBookListener {
             })
     }
 
+    /// Copy of the state for snapshot validation. Runs under the listener
+    /// mutex every 60 s; a serial deep clone of all books stalled the listener
+    /// ~350-400 ms per minute (2026-09-27), so books are cloned in parallel.
     fn clone_state(&self) -> Option<OrderBookState> {
-        self.order_book_state.clone()
+        self.order_book_state.as_ref().map(OrderBookState::par_clone)
     }
 
     pub(crate) const fn is_ready(&self) -> bool {
@@ -679,11 +633,7 @@ impl OrderBookListener {
                 if self.last_fill.is_none_or(|height| height < batch.block_number()) {
                     // send fill updates if we received a new update
                     if let Some(tx) = &self.internal_message_tx {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let snapshot = Arc::new(InternalMessage::Fills { batch });
-                            let _unused = tx.send(snapshot);
-                        });
+                        let _unused = tx.send(Arc::new(InternalMessage::Fills { batch }));
                     }
                 }
             }
@@ -694,18 +644,23 @@ impl OrderBookListener {
                     .as_mut()
                     .map(|book| book.apply_updates(order_statuses.clone(), order_diffs.clone()))
                     .transpose()?;
+                // The block is only usable once both files have it, so the later write counts.
+                let local_time_us = order_statuses.local_time_us().max(order_diffs.local_time_us());
+                latency::APPLY_AFTER_WRITE_US.record_age_us(local_time_us);
+                latency::HL_WRITE_LAG_MS.record((local_time_us / 1000).saturating_sub(order_diffs.block_time()));
+                self.last_applied_local_time_us = local_time_us;
                 if let Some(cache) = &mut self.fetched_snapshot_cache {
                     cache.push_back((order_statuses.clone(), order_diffs.clone()));
                 }
+                // Broadcast sends are sync and never block, so send in place rather than
+                // tokio::spawn: a task spawned from here sat in this worker's unstealable
+                // LIFO slot until the listener released the worker (after compute_l2_snapshots),
+                // adding ~15 ms to L4 delivery (measured 2026-09-27). Also keeps message order.
                 if let Some(tx) = &self.internal_message_tx {
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let updates = Arc::new(InternalMessage::L4BookUpdates {
-                            diff_batch: order_diffs,
-                            status_batch: order_statuses,
-                        });
-                        let _unused = tx.send(updates);
-                    });
+                    let _unused = tx.send(Arc::new(InternalMessage::L4BookUpdates {
+                        diff_batch: order_diffs,
+                        status_batch: order_statuses,
+                    }));
                 }
             }
         }
@@ -754,9 +709,9 @@ impl OrderBookListener {
         }
     }
 
-    // forcibly grab current snapshot
-    pub(crate) fn compute_snapshot(&mut self) -> Option<TimedSnapshots> {
-        self.order_book_state.as_mut().map(|o| o.compute_snapshot())
+    /// (time, height, snapshot) of one coin's book; None if not ready or coin untracked.
+    pub(crate) fn compute_coin_snapshot(&self, coin: &Coin) -> Option<(u64, u64, Snapshot<InnerL4Order>)> {
+        self.order_book_state.as_ref().and_then(|o| o.compute_coin_snapshot(coin))
     }
 
     // prevent snapshotting mutiple times at the same height
@@ -965,11 +920,12 @@ impl DirectoryListener for OrderBookListener {
         let snapshot = self.l2_snapshots(true);
         if let Some(snapshot) = snapshot {
             if let Some(tx) = &self.internal_message_tx {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
-                    let _unused = tx.send(snapshot);
-                });
+                let _unused = tx.send(Arc::new(InternalMessage::Snapshot {
+                    l2_snapshots: snapshot.1,
+                    time: snapshot.0,
+                    local_time_us: self.last_applied_local_time_us,
+                    shared: SnapshotShared::default(),
+                }));
             }
         }
         Ok(())
@@ -1073,35 +1029,34 @@ impl OrderBookListener {
         let snapshot = self.l2_snapshots(true);
         if let Some(snapshot) = snapshot {
             if let Some(tx) = &self.internal_message_tx {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let snapshot =
-                        Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
-                    let _unused = tx.send(snapshot);
-                });
+                let _unused = tx.send(Arc::new(InternalMessage::Snapshot {
+                    l2_snapshots: snapshot.1,
+                    time: snapshot.0,
+                    local_time_us: self.last_applied_local_time_us,
+                    shared: SnapshotShared::default(),
+                }));
             }
         }
         Ok(())
     }
 }
 
-pub(crate) struct L2Snapshots(HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>);
+/// Every L2 variant of one coin's book. Shared (Arc) between consecutive
+/// snapshot messages until the coin's book changes.
+pub(crate) type CoinL2Snapshots = HashMap<L2SnapshotParams, Snapshot<InnerLevel>>;
+
+pub(crate) struct L2Snapshots(HashMap<Coin, Arc<CoinL2Snapshots>>);
 
 impl L2Snapshots {
-    pub(crate) const fn as_ref(&self) -> &HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>> {
+    pub(crate) const fn as_ref(&self) -> &HashMap<Coin, Arc<CoinL2Snapshots>> {
         &self.0
     }
 }
 
-pub(crate) struct TimedSnapshots {
-    pub(crate) time: u64,
-    pub(crate) height: u64,
-    pub(crate) snapshot: Snapshots<InnerL4Order>,
-}
-
 // Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
-    Snapshot { l2_snapshots: L2Snapshots, time: u64 },
+    /// `local_time_us`: hl-node write time of the block this snapshot reflects.
+    Snapshot { l2_snapshots: L2Snapshots, time: u64, local_time_us: u64, shared: SnapshotShared },
     Fills { batch: Batch<NodeDataFill> },
     L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
 }
@@ -1112,106 +1067,3 @@ pub(crate) struct L2SnapshotParams {
     mantissa: Option<u64>,
 }
 
-#[cfg(test)]
-mod lag_watchdog_tests {
-    use super::*;
-
-    const OVER: i64 = MAX_BLOCK_TIME_LAG_MS + 60_000;
-
-    #[test]
-    fn under_ceiling_is_ok_and_resets_deferrals() {
-        assert_eq!(lag_verdict(MAX_BLOCK_TIME_LAG_MS, Some(OVER), 7), LagVerdict::Ok);
-    }
-
-    #[test]
-    fn over_ceiling_and_shrinking_defers() {
-        // 300s -> 240s: hl-node is replaying, consumer is winning.
-        assert_eq!(lag_verdict(240_000, Some(300_000), 0), LagVerdict::DeferCatchup(1));
-    }
-
-    #[test]
-    fn over_ceiling_and_growing_is_fatal() {
-        // Genuine starvation: lag climbing. Must NOT be exempted.
-        assert_eq!(
-            lag_verdict(300_000, Some(240_000), 0),
-            LagVerdict::Fatal { shrinking: false, deferrals: 0 }
-        );
-    }
-
-    #[test]
-    fn over_ceiling_and_flat_is_fatal() {
-        // A wedged consumer holds lag constant — the case the watchdog exists for.
-        assert_eq!(
-            lag_verdict(300_000, Some(300_000), 0),
-            LagVerdict::Fatal { shrinking: false, deferrals: 0 }
-        );
-    }
-
-    #[test]
-    fn jitter_sized_shrink_does_not_count_as_catchup() {
-        // Below CATCHUP_MIN_SHRINK_MS: noise, not progress.
-        assert_eq!(
-            lag_verdict(300_000, Some(300_000 + CATCHUP_MIN_SHRINK_MS - 1), 0),
-            LagVerdict::Fatal { shrinking: false, deferrals: 0 }
-        );
-    }
-
-    #[test]
-    fn no_previous_sample_is_fatal_not_exempt() {
-        // First checkable tick after a skip must fail closed, never assume progress.
-        assert_eq!(
-            lag_verdict(OVER, None, 0),
-            LagVerdict::Fatal { shrinking: false, deferrals: 0 }
-        );
-    }
-
-    #[test]
-    fn deferrals_are_bounded() {
-        // At the cap, even genuine shrinking must die — bounds the exemption.
-        assert_eq!(
-            lag_verdict(240_000, Some(300_000), MAX_CATCHUP_DEFERRALS),
-            LagVerdict::Fatal { shrinking: true, deferrals: MAX_CATCHUP_DEFERRALS }
-        );
-        assert_eq!(
-            lag_verdict(240_000, Some(300_000), MAX_CATCHUP_DEFERRALS - 1),
-            LagVerdict::DeferCatchup(MAX_CATCHUP_DEFERRALS)
-        );
-    }
-
-    #[test]
-    fn slow_shrink_cannot_defer_forever() {
-        // Pathological: shrinks just enough each tick. Must still terminate.
-        let mut lag = 10_000_000i64;
-        let mut deferrals = 0u32;
-        // Seed a prior sample: without one the first tick fails closed (see
-        // `no_previous_sample_is_fatal_not_exempt`), which is correct but is
-        // not the unbounded-deferral case under test here.
-        let mut prev = Some(lag + CATCHUP_MIN_SHRINK_MS);
-        for _ in 0..(MAX_CATCHUP_DEFERRALS + 5) {
-            match lag_verdict(lag, prev, deferrals) {
-                LagVerdict::DeferCatchup(n) => deferrals = n,
-                LagVerdict::Fatal { .. } => {
-                    assert_eq!(deferrals, MAX_CATCHUP_DEFERRALS, "must die at the cap");
-                    return;
-                }
-                LagVerdict::Ok => panic!("lag never dropped under ceiling"),
-            }
-            prev = Some(lag);
-            lag -= CATCHUP_MIN_SHRINK_MS;
-        }
-        panic!("exemption never terminated — unbounded deferral");
-    }
-
-    #[test]
-    fn recovery_below_ceiling_clears_state_for_next_stall() {
-        // Deferrals accumulate, lag recovers, then a NEW genuine stall must
-        // get a full fatal decision rather than inheriting a spent budget.
-        assert_eq!(lag_verdict(240_000, Some(300_000), 0), LagVerdict::DeferCatchup(1));
-        assert_eq!(lag_verdict(50_000, Some(240_000), 1), LagVerdict::Ok);
-        // caller resets deferrals to 0 on Ok; a later flat-high lag is fatal
-        assert_eq!(
-            lag_verdict(300_000, Some(300_000), 0),
-            LagVerdict::Fatal { shrinking: false, deferrals: 0 }
-        );
-    }
-}

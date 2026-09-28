@@ -30,6 +30,10 @@ impl NodeDataOrderDiff {
         Coin::new(&self.coin)
     }
 
+    pub(crate) fn coin_str(&self) -> &str {
+        &self.coin
+    }
+
     pub(crate) fn px(&self) -> &str {
         &self.px
     }
@@ -85,11 +89,20 @@ impl<E> Batch<E> {
         self.block_time.and_utc().timestamp_millis().try_into().unwrap()
     }
 
+    /// When hl-node wrote this batch (UTC, µs since epoch).
+    pub(crate) fn local_time_us(&self) -> u64 {
+        self.local_time.and_utc().timestamp_micros().try_into().unwrap_or(0)
+    }
+
     pub(crate) const fn block_number(&self) -> u64 {
         self.block_number
     }
 
     pub(crate) fn events(self) -> Vec<E> {
         self.events
+    }
+
+    pub(crate) fn events_ref(&self) -> &[E] {
+        &self.events
     }
 }

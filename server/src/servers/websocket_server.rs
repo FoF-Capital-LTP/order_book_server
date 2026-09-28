@@ -1,12 +1,12 @@
 use crate::{
+    latency,
     listeners::order_book::{
-        InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
+        InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, hl_listen,
     },
-    order_book::{Coin, Side, Snapshot},
+    order_book::{Coin, Side},
     prelude::*,
     types::{
         Fill, L2Book, L4Book, L4BookUpdates, L4Order, Trade, WsOrder, WsUserFills,
-        inner::InnerLevel,
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::{ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager},
     },
@@ -14,24 +14,31 @@ use crate::{
 use alloy::primitives::Address;
 use axum::{Router, response::IntoResponse, routing::get, serve::ListenerExt};
 use futures_util::{SinkExt, StreamExt};
-use log::{error, info};
+use log::{error, info, warn};
 use std::{
     collections::{HashMap, HashSet},
     env::home_dir,
-    sync::Arc,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 use tokio::select;
 use tokio::{
     net::TcpListener,
     sync::{
         Mutex,
-        broadcast::{Sender, channel},
+        broadcast::{Sender, channel, error::RecvError},
     },
 };
 use yawc::{FrameView, OpCode, WebSocket};
 
+/// Broadcast backlog per client, in messages (~40/s: fills, L4 updates and an
+/// L2 snapshot per block), so ~25 s. A client further behind than this loses
+/// messages (see `handle_socket`). Slots are freed as soon as every client has
+/// read them, so the backlog only holds memory while some client is behind.
+const BROADCAST_CAPACITY: usize = 1024;
+
 pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_level: u32) -> Result<()> {
-    let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(100);
+    let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(BROADCAST_CAPACITY);
 
     // Central task: listen to messages and forward them for distribution
     let home_dir = home_dir().ok_or("Could not find home directory")?;
@@ -40,6 +47,7 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
         OrderBookListener::new(Some(internal_message_tx), ignore_spot)
     };
     let listener = Arc::new(Mutex::new(listener));
+    tokio::spawn(latency::report_loop(Duration::from_secs(60)));
     {
         let listener = listener.clone();
         tokio::spawn(async move {
@@ -110,7 +118,8 @@ async fn handle_socket(
     let mut internal_message_rx = internal_message_tx.subscribe();
     let is_ready = listener.lock().await.is_ready();
     let mut manager = SubscriptionManager::default();
-    let mut universe = listener.lock().await.universe().into_iter().map(|c| c.value()).collect();
+    let mut universe: Arc<HashSet<String>> =
+        Arc::new(listener.lock().await.universe().into_iter().map(|c| c.value()).collect());
     if !is_ready {
         let msg = ServerResponse::Error("Order book not ready for streaming (waiting for snapshot)".to_string());
         send_socket_message(&mut socket, msg).await;
@@ -121,31 +130,65 @@ async fn handle_socket(
             recv_result = internal_message_rx.recv() => {
                 match recv_result {
                     Ok(msg) => {
-                        match msg.as_ref() {
-                            InternalMessage::Snapshot{ l2_snapshots, time } => {
-                                universe = new_universe(l2_snapshots, ignore_spot);
+                        latency::CLIENT_QUEUE_LEN.record(internal_message_rx.len() as u64);
+                        let handle_start = Instant::now();
+                        // (histogram, hl-node write time) if this client subscribes to the stream
+                        let delivered = match msg.as_ref() {
+                            InternalMessage::Snapshot{ l2_snapshots, time, local_time_us, shared } => {
+                                universe = shared.universe(l2_snapshots, ignore_spot);
                                 for sub in manager.subscriptions() {
-                                    send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time).await;
+                                    send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots, *time, shared).await;
                                 }
+                                manager
+                                    .subscriptions()
+                                    .iter()
+                                    .any(|sub| matches!(sub, Subscription::L2Book { .. }))
+                                    .then_some((&latency::CLIENT_L2_AFTER_WRITE_US, *local_time_us))
                             },
                             InternalMessage::Fills{ batch } => {
-                                let mut trades = coin_to_trades(batch);
-                                let mut user_fills = user_to_fills(batch);
+                                let wanted = WantedKeys::new(manager.subscriptions());
+                                let mut trades = if wanted.trades { coin_to_trades(batch) } else { HashMap::new() };
+                                let mut user_fills = user_to_fills(batch, &wanted.user_fills);
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
                                     send_ws_data_from_user_fills(&mut socket, sub, &mut user_fills).await;
                                 }
+                                (wanted.trades || !wanted.user_fills.is_empty())
+                                    .then(|| (&latency::CLIENT_FILLS_AFTER_WRITE_US, batch.local_time_us()))
                             },
                             InternalMessage::L4BookUpdates{ diff_batch, status_batch } => {
-                                let mut book_updates = coin_to_book_updates(diff_batch, status_batch);
-                                let mut user_orders = user_to_order_updates(status_batch);
+                                let wanted = WantedKeys::new(manager.subscriptions());
+                                let mut book_updates = coin_to_book_updates(diff_batch, status_batch, &wanted.l4_books);
+                                let mut user_orders = user_to_order_updates(status_batch, &wanted.order_updates);
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
                                     send_ws_data_from_order_updates(&mut socket, sub, &mut user_orders).await;
                                 }
+                                (!wanted.l4_books.is_empty() || !wanted.order_updates.is_empty()).then(|| {
+                                    let local_time_us = diff_batch.local_time_us().max(status_batch.local_time_us());
+                                    (&latency::CLIENT_L4_AFTER_WRITE_US, local_time_us)
+                                })
                             },
+                        };
+                        latency::CLIENT_HANDLE_US.record_duration_us(handle_start.elapsed());
+                        if let Some((histogram, local_time_us)) = delivered {
+                            histogram.record_age_us(local_time_us);
                         }
 
+                    }
+                    Err(RecvError::Lagged(skipped)) => {
+                        // Skipped L2 snapshots are superseded by the next one, but skipped
+                        // trades, fills and L4/order updates are lost for good: drop those
+                        // clients so they reconnect and resync.
+                        let subs = manager.subscriptions();
+                        let l2_only = subs.iter().all(|sub| matches!(sub, Subscription::L2Book { .. }));
+                        let summary = subscription_summary(subs);
+                        if l2_only {
+                            warn!("Receiver lagged by {skipped} messages; continuing (L2-only client: {summary})");
+                        } else {
+                            error!("Receiver error: channel lagged by {skipped}; disconnecting ({summary})");
+                            return;
+                        }
                     }
                     Err(err) => {
                         error!("Receiver error: {err}");
@@ -257,17 +300,25 @@ async fn receive_client_message(
     }
 }
 
-async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
-    let msg = serde_json::to_string(&msg);
-    match msg {
-        Ok(msg) => {
-            if let Err(err) = socket.send(FrameView::text(msg)).await {
-                error!("Failed to send: {err}");
-            }
-        }
+fn serialize_message(msg: &ServerResponse) -> Option<FrameView> {
+    match serde_json::to_string(msg) {
+        Ok(msg) => Some(FrameView::text(msg)),
         Err(err) => {
             error!("Server response serialization error: {err}");
+            None
         }
+    }
+}
+
+async fn send_frame(socket: &mut WebSocket, frame: FrameView) {
+    if let Err(err) = socket.send(frame).await {
+        error!("Failed to send: {err}");
+    }
+}
+
+async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
+    if let Some(frame) = serialize_message(&msg) {
+        send_frame(socket, frame).await;
     }
 }
 
@@ -280,29 +331,124 @@ fn new_universe(l2_snapshots: &L2Snapshots, ignore_spot: bool) -> HashSet<String
         .collect()
 }
 
+/// (coin, n_sig_figs, mantissa, n_levels) of an L2Book subscription.
+type L2FrameKey = (String, Option<u32>, Option<u64>, usize);
+
+/// Work shared by all clients handling the same snapshot message: the
+/// universe and each distinct L2Book response are built once, not per client.
+#[derive(Default)]
+pub(crate) struct SnapshotShared {
+    universe: OnceLock<Arc<HashSet<String>>>,
+    /// None: the coin or params are not in the snapshot.
+    l2_frames: std::sync::Mutex<HashMap<L2FrameKey, Option<FrameView>>>,
+}
+
+impl SnapshotShared {
+    fn universe(&self, l2_snapshots: &L2Snapshots, ignore_spot: bool) -> Arc<HashSet<String>> {
+        self.universe.get_or_init(|| Arc::new(new_universe(l2_snapshots, ignore_spot))).clone()
+    }
+
+    /// The serialized L2Book response for `key`. Serialization runs outside the
+    /// lock; two clients racing on a new key both build the same bytes.
+    #[allow(clippy::unwrap_used)]
+    fn l2_frame(&self, key: L2FrameKey, build: impl FnOnce(&L2FrameKey) -> Option<FrameView>) -> Option<FrameView> {
+        if let Some(frame) = self.l2_frames.lock().unwrap().get(&key) {
+            return frame.clone();
+        }
+        let frame = build(&key);
+        self.l2_frames.lock().unwrap().entry(key).or_insert(frame).clone()
+    }
+}
+
+fn build_l2_frame(l2_snapshots: &L2Snapshots, key: &L2FrameKey, time: u64) -> Option<FrameView> {
+    let (coin, n_sig_figs, mantissa, n_levels) = key;
+    let snapshot = l2_snapshots.as_ref().get(&Coin::new(coin))?.get(&L2SnapshotParams::new(*n_sig_figs, *mantissa))?;
+    let snapshot = snapshot.truncate(*n_levels).export_inner_snapshot();
+    serialize_message(&ServerResponse::L2Book(L2Book::from_l2_snapshot(coin.clone(), snapshot, time)))
+}
+
 async fn send_ws_data_from_snapshot(
     socket: &mut WebSocket,
     subscription: &Subscription,
-    snapshot: &HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>,
+    l2_snapshots: &L2Snapshots,
     time: u64,
+    shared: &SnapshotShared,
 ) {
     if let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription {
-        let snapshot = snapshot.get(&Coin::new(coin));
-        if let Some(snapshot) =
-            snapshot.and_then(|snapshot| snapshot.get(&L2SnapshotParams::new(*n_sig_figs, *mantissa)))
-        {
-            let n_levels = n_levels.unwrap_or(DEFAULT_LEVELS);
-            let snapshot = snapshot.truncate(n_levels);
-            let snapshot = snapshot.export_inner_snapshot();
-            let l2_book = L2Book::from_l2_snapshot(coin.clone(), snapshot, time);
-            let msg = ServerResponse::L2Book(l2_book);
-            send_socket_message(socket, msg).await;
-        } else {
+        let key = (coin.clone(), *n_sig_figs, *mantissa, n_levels.unwrap_or(DEFAULT_LEVELS));
+        let known = l2_snapshots
+            .as_ref()
+            .get(&Coin::new(coin))
+            .is_some_and(|coin_snapshots| coin_snapshots.contains_key(&L2SnapshotParams::new(*n_sig_figs, *mantissa)));
+        if !known {
             error!("Coin {coin} not found");
+            return;
+        }
+        if let Some(frame) = shared.l2_frame(key, |key| build_l2_frame(l2_snapshots, key, time)) {
+            send_frame(socket, frame).await;
         }
     }
 }
 
+/// e.g. "l2Book=3 trades=1", for logs.
+fn subscription_summary(subs: &HashSet<Subscription>) -> String {
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for sub in subs {
+        let kind = match sub {
+            Subscription::Trades { .. } => "trades",
+            Subscription::L2Book { .. } => "l2Book",
+            Subscription::L4Book { .. } => "l4Book",
+            Subscription::OrderUpdates { .. } => "orderUpdates",
+            Subscription::UserFills { .. } => "userFills",
+        };
+        *counts.entry(kind).or_default() += 1;
+    }
+    if counts.is_empty() {
+        return "no subscriptions".to_string();
+    }
+    counts.iter().map(|(kind, n)| format!("{kind}={n}")).collect::<Vec<_>>().join(" ")
+}
+
+/// What one client subscribes to, per block-event stream.
+///
+/// Every client task receives every block, and used to group (and clone) all
+/// of it -- the whole order-status batch twice -- before picking out its few
+/// coins or users. With ~70 clients that per-client copying was the largest
+/// single chunk of obs CPU (perf, 2026-09-26). Grouping only the subscribed
+/// keys produces identical messages.
+struct WantedKeys<'a> {
+    trades: bool,
+    l4_books: HashSet<&'a str>,
+    user_fills: HashSet<Address>,
+    order_updates: HashSet<Address>,
+}
+
+impl<'a> WantedKeys<'a> {
+    fn new(subscriptions: &'a HashSet<Subscription>) -> Self {
+        let mut wanted =
+            Self { trades: false, l4_books: HashSet::new(), user_fills: HashSet::new(), order_updates: HashSet::new() };
+        for sub in subscriptions {
+            match sub {
+                Subscription::Trades { .. } => wanted.trades = true,
+                Subscription::L4Book { coin } => {
+                    wanted.l4_books.insert(coin.as_str());
+                }
+                Subscription::UserFills { user, .. } => {
+                    wanted.user_fills.insert(*user);
+                }
+                Subscription::OrderUpdates { user } => {
+                    wanted.order_updates.insert(*user);
+                }
+                Subscription::L2Book { .. } => {}
+            }
+        }
+        wanted
+    }
+}
+
+// Not filtered by coin like the other groupings: trades pair fills by `tid`,
+// and keeping that pairing exactly as before matters more than the saving
+// (fills are a small stream). Skipped entirely when nothing needs trades.
 fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
     // Group fills by trade id. A valid trade has exactly one Ask + one Bid fill
     // sharing the same `tid`. Anything else (single-sided fills, same-side pairs
@@ -345,19 +491,21 @@ fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
 fn coin_to_book_updates(
     diff_batch: &Batch<NodeDataOrderDiff>,
     status_batch: &Batch<NodeDataOrderStatus>,
+    coins: &HashSet<&str>,
 ) -> HashMap<String, L4BookUpdates> {
-    let diffs = diff_batch.clone().events();
-    let statuses = status_batch.clone().events();
     let time = diff_batch.block_time();
     let height = diff_batch.block_number();
     let mut updates = HashMap::new();
-    for diff in diffs {
-        let coin = diff.coin().value();
-        updates.entry(coin).or_insert_with(|| L4BookUpdates::new(time, height)).book_diffs.push(diff);
+    if coins.is_empty() {
+        return updates;
     }
-    for status in statuses {
+    for diff in diff_batch.events_ref().iter().filter(|d| coins.contains(d.coin_str())) {
+        let coin = diff.coin_str().to_string();
+        updates.entry(coin).or_insert_with(|| L4BookUpdates::new(time, height)).book_diffs.push(diff.clone());
+    }
+    for status in status_batch.events_ref().iter().filter(|s| coins.contains(s.order.coin.as_str())) {
         let coin = status.order.coin.clone();
-        updates.entry(coin).or_insert_with(|| L4BookUpdates::new(time, height)).order_statuses.push(status);
+        updates.entry(coin).or_insert_with(|| L4BookUpdates::new(time, height)).order_statuses.push(status.clone());
     }
     updates
 }
@@ -392,20 +540,28 @@ async fn send_ws_data_from_trades(
 /// pair, so the same physical fill belongs to exactly one user (the maker or
 /// taker side recorded on that node event); this matches HL's per-user push
 /// where each side gets its own `userFills` notification.
-fn user_to_fills(batch: &Batch<NodeDataFill>) -> HashMap<Address, Vec<Fill>> {
+fn user_to_fills(batch: &Batch<NodeDataFill>, users: &HashSet<Address>) -> HashMap<Address, Vec<Fill>> {
     let mut by_user: HashMap<Address, Vec<Fill>> = HashMap::new();
-    for NodeDataFill(user, fill) in batch.clone().events() {
-        by_user.entry(user).or_default().push(fill);
+    if users.is_empty() {
+        return by_user;
+    }
+    for NodeDataFill(user, fill) in batch.events_ref().iter().filter(|f| users.contains(&f.0)) {
+        by_user.entry(*user).or_default().push(fill.clone());
     }
     by_user
 }
 
 /// Group node order-status events by user and convert each one to a `WsOrder`.
-fn user_to_order_updates(status_batch: &Batch<NodeDataOrderStatus>) -> HashMap<Address, Vec<WsOrder>> {
+fn user_to_order_updates(
+    status_batch: &Batch<NodeDataOrderStatus>,
+    users: &HashSet<Address>,
+) -> HashMap<Address, Vec<WsOrder>> {
     let mut by_user: HashMap<Address, Vec<WsOrder>> = HashMap::new();
-    for status in status_batch.clone().events() {
-        let user = status.user;
-        by_user.entry(user).or_default().push(WsOrder::from_node_status(&status));
+    if users.is_empty() {
+        return by_user;
+    }
+    for status in status_batch.events_ref().iter().filter(|s| users.contains(&s.user)) {
+        by_user.entry(status.user).or_default().push(WsOrder::from_node_status(status));
     }
     by_user
 }
@@ -444,20 +600,18 @@ impl Subscription {
         listener: Arc<Mutex<OrderBookListener>>,
     ) -> Result<Option<ServerResponse>> {
         if let Self::L4Book { coin } = self {
-            let snapshot = listener.lock().await.compute_snapshot();
-            if let Some(TimedSnapshots { time, height, snapshot }) = snapshot {
-                let snapshot =
-                    snapshot.value().into_iter().filter(|(c, _)| *c == Coin::new(coin)).collect::<Vec<_>>().pop();
-                if let Some((coin, snapshot)) = snapshot {
-                    let snapshot =
-                        snapshot.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect());
-                    return Ok(Some(ServerResponse::L4Book(L4Book::Snapshot {
-                        coin: coin.value(),
-                        time,
-                        height,
-                        levels: snapshot,
-                    })));
-                }
+            // Only this coin's book: snapshotting every coin here held the
+            // listener mutex long enough to stall block processing.
+            let coin = Coin::new(coin);
+            let snapshot = listener.lock().await.compute_coin_snapshot(&coin);
+            if let Some((time, height, snapshot)) = snapshot {
+                let snapshot = snapshot.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect());
+                return Ok(Some(ServerResponse::L4Book(L4Book::Snapshot {
+                    coin: coin.value(),
+                    time,
+                    height,
+                    levels: snapshot,
+                })));
             }
             return Err("Snapshot Failed".into());
         }
@@ -549,5 +703,245 @@ mod test {
         let trades = coin_to_trades(&batch);
         assert_eq!(trades.get("BTC").map(Vec::len), Some(1));
         assert_eq!(trades.get("ETH").map(Vec::len), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod wanted_keys_test {
+    use super::{coin_to_book_updates, user_to_fills, user_to_order_updates};
+    use crate::types::{
+        Fill, L4BookUpdates, WsOrder,
+        node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+    };
+    use alloy::primitives::Address;
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    // The pre-filtering implementations: group everything, then look up.
+    fn old_book_updates(
+        diff_batch: &Batch<NodeDataOrderDiff>,
+        status_batch: &Batch<NodeDataOrderStatus>,
+    ) -> HashMap<String, L4BookUpdates> {
+        let (time, height) = (diff_batch.block_time(), diff_batch.block_number());
+        let mut updates = HashMap::new();
+        for diff in diff_batch.clone().events() {
+            updates.entry(diff.coin().value()).or_insert_with(|| L4BookUpdates::new(time, height)).book_diffs.push(diff);
+        }
+        for status in status_batch.clone().events() {
+            let coin = status.order.coin.clone();
+            updates.entry(coin).or_insert_with(|| L4BookUpdates::new(time, height)).order_statuses.push(status);
+        }
+        updates
+    }
+
+    fn old_order_updates(status_batch: &Batch<NodeDataOrderStatus>) -> HashMap<Address, Vec<WsOrder>> {
+        let mut by_user: HashMap<Address, Vec<WsOrder>> = HashMap::new();
+        for status in status_batch.clone().events() {
+            by_user.entry(status.user).or_default().push(WsOrder::from_node_status(&status));
+        }
+        by_user
+    }
+
+    fn old_user_fills(batch: &Batch<NodeDataFill>) -> HashMap<Address, Vec<Fill>> {
+        let mut by_user: HashMap<Address, Vec<Fill>> = HashMap::new();
+        for NodeDataFill(user, fill) in batch.clone().events() {
+            by_user.entry(user).or_default().push(fill);
+        }
+        by_user
+    }
+
+    // What a client subscribed to `keys` would have been sent, as JSON.
+    fn sent<K: std::hash::Hash + Eq + Clone + Ord, V: serde::Serialize>(
+        mut map: HashMap<K, V>,
+        keys: &[K],
+    ) -> BTreeMap<K, serde_json::Value> {
+        keys.iter()
+            .filter_map(|k| map.remove(k).map(|v| (k.clone(), serde_json::to_value(v).unwrap_or_default())))
+            .collect()
+    }
+
+    fn load<E: for<'a> serde::Deserialize<'a>>(fixture: &serde_json::Value, name: &str) -> Vec<Batch<E>> {
+        fixture[name]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|l| l.as_str().and_then(|l| serde_json::from_str(l).ok()))
+            .collect()
+    }
+
+    // Real blocks captured from the node (server/tmp/fixture/blocks.json, not
+    // committed). Skipped when absent.
+    #[test]
+    fn filtered_grouping_matches_old_on_real_blocks() {
+        let Ok(raw) = std::fs::read_to_string("tmp/fixture/blocks.json") else {
+            eprintln!("fixture missing, skipping");
+            return;
+        };
+        let fixture: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        let statuses: Vec<Batch<NodeDataOrderStatus>> = load(&fixture, "statuses");
+        let diffs: Vec<Batch<NodeDataOrderDiff>> = load(&fixture, "diffs");
+        let fills: Vec<Batch<NodeDataFill>> = load(&fixture, "fills");
+        assert!(statuses.len() >= 10 && diffs.len() >= 10 && fills.len() >= 10, "fixture did not parse");
+
+        // Busiest coins/users, a quiet one, and one that never appears.
+        let mut coin_count: HashMap<String, usize> = HashMap::new();
+        let mut user_count: HashMap<Address, usize> = HashMap::new();
+        for b in &statuses {
+            for s in b.events_ref() {
+                *coin_count.entry(s.order.coin.clone()).or_default() += 1;
+                *user_count.entry(s.user).or_default() += 1;
+            }
+        }
+        for b in &fills {
+            for f in b.events_ref() {
+                *user_count.entry(f.0).or_default() += 1;
+            }
+        }
+        let mut coins: Vec<String> = coin_count.keys().cloned().collect();
+        coins.sort_by_key(|c| std::cmp::Reverse(coin_count[c]));
+        let mut users: Vec<Address> = user_count.keys().copied().collect();
+        users.sort_by_key(|u| std::cmp::Reverse(user_count[u]));
+        let coin_sets: Vec<Vec<String>> = vec![
+            vec![],
+            coins[..3].to_vec(),
+            vec![coins[coins.len() - 1].clone(), "NO_SUCH_COIN".to_string()],
+            coins.clone(),
+        ];
+        let fill_users: Vec<Address> = fills.iter().flat_map(|b| b.events_ref().iter().map(|f| f.0)).collect();
+        let user_sets: Vec<Vec<Address>> =
+            vec![vec![], users[..3].to_vec(), vec![fill_users[0], Address::repeat_byte(0xab)], users.clone()];
+
+        let mut compared = 0usize;
+        for (sb, db) in statuses.iter().zip(&diffs) {
+            for set in &coin_sets {
+                let wanted: HashSet<&str> = set.iter().map(String::as_str).collect();
+                let new = sent(coin_to_book_updates(db, sb, &wanted), set);
+                let old = sent(old_book_updates(db, sb), set);
+                assert_eq!(new, old, "l4Book {set:?}");
+                compared += new.len();
+            }
+            for set in &user_sets {
+                let wanted: HashSet<Address> = set.iter().copied().collect();
+                assert_eq!(sent(user_to_order_updates(sb, &wanted), set), sent(old_order_updates(sb), set));
+            }
+        }
+        for fb in &fills {
+            for set in &user_sets {
+                let wanted: HashSet<Address> = set.iter().copied().collect();
+                let new = sent(user_to_fills(fb, &wanted), set);
+                assert_eq!(new, sent(old_user_fills(fb), set));
+                compared += new.len();
+            }
+        }
+        assert!(compared > 100, "comparison was vacuous ({compared} keys)");
+    }
+}
+
+#[cfg(test)]
+mod l2_frame_test {
+    use super::*;
+    use crate::{
+        listeners::order_book::compute_l2_snapshots,
+        order_book::multi_book::{OrderBooks, load_snapshots_from_str},
+        types::{L4Order, inner::InnerL4Order},
+    };
+
+    /// Real hl-node L4 snapshot (copy of /root/out.json); test-only, not committed.
+    const FIXTURE: &str = "tmp/fixture/out.snap.json";
+
+    // The per-client path before frames were shared.
+    fn old_l2_message(l2_snapshots: &L2Snapshots, sub: &Subscription, time: u64) -> Option<String> {
+        let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = sub else { return None };
+        let snapshot = l2_snapshots.as_ref().get(&Coin::new(coin))?.get(&L2SnapshotParams::new(*n_sig_figs, *mantissa))?;
+        let snapshot = snapshot.truncate(n_levels.unwrap_or(DEFAULT_LEVELS)).export_inner_snapshot();
+        let l2_book = L2Book::from_l2_snapshot(coin.clone(), snapshot, time);
+        Some(serde_json::to_string(&ServerResponse::L2Book(l2_book)).unwrap())
+    }
+
+    fn shared_l2_message(
+        shared: &SnapshotShared,
+        l2_snapshots: &L2Snapshots,
+        sub: &Subscription,
+        time: u64,
+    ) -> Option<FrameView> {
+        let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = sub else { return None };
+        let key = (coin.clone(), *n_sig_figs, *mantissa, n_levels.unwrap_or(DEFAULT_LEVELS));
+        shared.l2_frame(key, |key| build_l2_frame(l2_snapshots, key, time))
+    }
+
+    #[test]
+    fn shared_l2_frames_match_per_client_serialization() {
+        let Ok(json) = fs::read_to_string(FIXTURE) else {
+            eprintln!("skipping: {FIXTURE} not present");
+            return;
+        };
+        let (_, snapshot) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json).unwrap();
+        drop(json);
+        let l2_snapshots = compute_l2_snapshots(&OrderBooks::from_snapshots(snapshot, true));
+        let time = 1_790_000_000_123;
+        let shared = SnapshotShared::default();
+
+        let universe = shared.universe(&l2_snapshots, true);
+        assert_eq!(*universe, new_universe(&l2_snapshots, true));
+        assert!(Arc::ptr_eq(&universe, &shared.universe(&l2_snapshots, true)));
+
+        let params = [
+            (None, None),
+            (Some(5), None),
+            (Some(5), Some(2)),
+            (Some(5), Some(5)),
+            (Some(4), None),
+            (Some(3), None),
+            (Some(2), None),
+        ];
+        let mut n_compared = 0;
+        let mut coins: Vec<String> = l2_snapshots.as_ref().keys().map(|c| c.value()).collect();
+        coins.push("NO_SUCH_COIN".to_string());
+        for coin in &coins {
+            for (n_sig_figs, mantissa) in params {
+                for n_levels in [None, Some(1), Some(5), Some(100)] {
+                    let sub = Subscription::L2Book { coin: coin.clone(), n_sig_figs, n_levels, mantissa };
+                    let old = old_l2_message(&l2_snapshots, &sub, time);
+                    let new = shared_l2_message(&shared, &l2_snapshots, &sub, time);
+                    assert_eq!(old.as_deref().map(str::as_bytes), new.as_ref().map(|f| &f.payload[..]), "{sub:?}");
+                    // A second client gets the cached frame: same bytes, no copy.
+                    let again = shared_l2_message(&shared, &l2_snapshots, &sub, time);
+                    assert_eq!(new.map(|f| f.payload.as_ptr()), again.map(|f| f.payload.as_ptr()), "{sub:?}");
+                    n_compared += usize::from(old.is_some());
+                }
+            }
+        }
+        assert!(n_compared > 1000 * params.len() * 4, "{n_compared}");
+    }
+
+    #[test]
+    fn concurrent_clients_get_identical_frames() {
+        let shared = SnapshotShared::default();
+        let key: L2FrameKey = ("BTC".to_string(), None, None, 20);
+        let payloads: Vec<Vec<u8>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let (shared, key) = (&shared, key.clone());
+                    scope.spawn(move || {
+                        let frame = shared.l2_frame(key, |_| Some(FrameView::text(format!("same bytes (built by {i})"))));
+                        frame.unwrap().payload.to_vec()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(payloads.iter().all(|p| p == &payloads[0]));
+    }
+
+    #[test]
+    fn subscription_summary_counts_by_kind() {
+        let subs: HashSet<Subscription> = [
+            Subscription::L2Book { coin: "BTC".into(), n_sig_figs: None, n_levels: None, mantissa: None },
+            Subscription::L2Book { coin: "ETH".into(), n_sig_figs: Some(5), n_levels: None, mantissa: None },
+            Subscription::Trades { coin: "BTC".into() },
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(subscription_summary(&subs), "l2Book=2 trades=1");
+        assert_eq!(subscription_summary(&HashSet::new()), "no subscriptions");
     }
 }

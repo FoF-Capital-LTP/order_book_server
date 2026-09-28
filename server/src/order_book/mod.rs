@@ -25,8 +25,10 @@ impl<O: Clone> Snapshot<O> {
         &self.0
     }
 
+    // Clones only the first n entries. Called per client per block on full-depth
+    // books, so cloning everything before taking n was a measurable cost.
     pub(crate) fn truncate(&self, n: usize) -> Self {
-        Self(self.0.clone().map(|orders| orders.into_iter().take(n).collect_vec()))
+        Self(self.0.each_ref().map(|orders| orders.iter().take(n).cloned().collect_vec()))
     }
 }
 

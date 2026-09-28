@@ -1,18 +1,16 @@
 use crate::{
-    listeners::order_book::{L2SnapshotParams, L2Snapshots},
+    listeners::order_book::{CoinL2Snapshots, L2SnapshotParams},
     order_book::{
-        Coin, Snapshot,
-        multi_book::{OrderBooks, Snapshots},
+        Coin, OrderBook, Snapshot,
+        multi_book::Snapshots,
         types::InnerOrder,
     },
     prelude::*,
     types::{
-        inner::InnerLevel,
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
 use log::warn;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use reqwest::Client;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -182,37 +180,47 @@ impl L2SnapshotParams {
     }
 }
 
-pub(super) fn compute_l2_snapshots<O: InnerOrder + Send + Sync>(order_books: &OrderBooks<O>) -> L2Snapshots {
-    L2Snapshots(
+/// All L2 variants (full depth, 5 sig figs with mantissa None/2/5, then 4, 3, 2 sig figs) of one book.
+pub(super) fn compute_coin_l2_snapshots<O: InnerOrder>(order_book: &OrderBook<O>) -> CoinL2Snapshots {
+    let mut entries = Vec::new();
+    let snapshot = order_book.to_l2_snapshot(None, None, None);
+    entries.push((L2SnapshotParams { n_sig_figs: None, mantissa: None }, snapshot));
+    let mut add_new_snapshot = |n_sig_figs: Option<u32>, mantissa: Option<u64>, idx: usize| {
+        if let Some((_, last_snapshot)) = &entries.get(entries.len() - idx) {
+            let snapshot = last_snapshot.to_l2_snapshot(None, n_sig_figs, mantissa);
+            entries.push((L2SnapshotParams { n_sig_figs, mantissa }, snapshot));
+        }
+    };
+    for n_sig_figs in (2..=5).rev() {
+        if n_sig_figs == 5 {
+            for mantissa in [None, Some(2), Some(5)] {
+                if mantissa == Some(5) {
+                    // Some(2) is NOT a superset of this info!
+                    add_new_snapshot(Some(n_sig_figs), mantissa, 2);
+                } else {
+                    add_new_snapshot(Some(n_sig_figs), mantissa, 1);
+                }
+            }
+        } else {
+            add_new_snapshot(Some(n_sig_figs), None, 1);
+        }
+    }
+    entries.into_iter().collect()
+}
+
+/// Full recompute of every book; the reference the incremental cache in
+/// `OrderBookState::l2_snapshots` is tested against.
+#[cfg(test)]
+pub(crate) fn compute_l2_snapshots<O: InnerOrder + Send + Sync>(
+    order_books: &crate::order_book::multi_book::OrderBooks<O>,
+) -> super::L2Snapshots {
+    use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+    use std::sync::Arc;
+    super::L2Snapshots(
         order_books
             .as_ref()
             .par_iter()
-            .map(|(coin, order_book)| {
-                let mut entries = Vec::new();
-                let snapshot = order_book.to_l2_snapshot(None, None, None);
-                entries.push((L2SnapshotParams { n_sig_figs: None, mantissa: None }, snapshot));
-                let mut add_new_snapshot = |n_sig_figs: Option<u32>, mantissa: Option<u64>, idx: usize| {
-                    if let Some((_, last_snapshot)) = &entries.get(entries.len() - idx) {
-                        let snapshot = last_snapshot.to_l2_snapshot(None, n_sig_figs, mantissa);
-                        entries.push((L2SnapshotParams { n_sig_figs, mantissa }, snapshot));
-                    }
-                };
-                for n_sig_figs in (2..=5).rev() {
-                    if n_sig_figs == 5 {
-                        for mantissa in [None, Some(2), Some(5)] {
-                            if mantissa == Some(5) {
-                                // Some(2) is NOT a superset of this info!
-                                add_new_snapshot(Some(n_sig_figs), mantissa, 2);
-                            } else {
-                                add_new_snapshot(Some(n_sig_figs), mantissa, 1);
-                            }
-                        }
-                    } else {
-                        add_new_snapshot(Some(n_sig_figs), None, 1);
-                    }
-                }
-                (coin.clone(), entries.into_iter().collect::<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>())
-            })
+            .map(|(coin, order_book)| (coin.clone(), Arc::new(compute_coin_l2_snapshots(order_book))))
             .collect(),
     )
 }

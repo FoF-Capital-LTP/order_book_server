@@ -1,5 +1,5 @@
 use crate::{
-    listeners::order_book::{L2Snapshots, TimedSnapshots, utils::compute_l2_snapshots},
+    listeners::order_book::{CoinL2Snapshots, L2Snapshots, utils::compute_coin_l2_snapshots},
     order_book::{
         Coin, InnerOrder, Oid, Px, Snapshot,
         multi_book::{OrderBooks, Snapshots},
@@ -11,7 +11,11 @@ use crate::{
     },
 };
 use log::warn;
-use std::collections::{HashMap, HashSet, VecDeque};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
 
 /// Don't re-warn about the same not-yet-grafted coin more often than this
 /// many blocks. ~14.5 blocks/s ⇒ 200 blocks ≈ 14 seconds. Keeps the log
@@ -37,6 +41,9 @@ pub(super) struct OrderBookState {
     /// Throttle map for "skipping <Op> for not-yet-grafted coin" warnings.
     /// Value is the block height at which we last warned for that coin.
     not_yet_grafted_last_warn: HashMap<Coin, u64>,
+    /// L2 variants per coin as of the last `l2_snapshots`; only coins that
+    /// `order_book.take_changed()` reports are recomputed.
+    l2_cache: HashMap<Coin, Arc<CoinL2Snapshots>>,
 }
 
 impl OrderBookState {
@@ -55,6 +62,7 @@ impl OrderBookState {
             snapped: false,
             allow_initial_gap: true,
             not_yet_grafted_last_warn: HashMap::new(),
+            l2_cache: HashMap::new(),
         }
     }
 
@@ -77,9 +85,27 @@ impl OrderBookState {
         self.height
     }
 
-    // forcibly take snapshot - (time, height, snapshot)
-    pub(super) fn compute_snapshot(&self) -> TimedSnapshots {
-        TimedSnapshots { time: self.time, height: self.height, snapshot: self.order_book.to_snapshots_par() }
+    // forcibly take snapshot of all books
+    pub(super) fn compute_snapshot(&self) -> Snapshots<InnerL4Order> {
+        self.order_book.to_snapshots_par()
+    }
+
+    pub(super) fn compute_coin_snapshot(&self, coin: &Coin) -> Option<(u64, u64, Snapshot<InnerL4Order>)> {
+        self.order_book.as_ref().get(coin).map(|book| (self.time, self.height, book.to_snapshot()))
+    }
+
+    /// Same as `clone()`, but clones the per-coin books in parallel.
+    pub(super) fn par_clone(&self) -> Self {
+        Self {
+            order_book: self.order_book.par_clone(),
+            height: self.height,
+            time: self.time,
+            snapped: self.snapped,
+            ignore_spot: self.ignore_spot,
+            allow_initial_gap: self.allow_initial_gap,
+            not_yet_grafted_last_warn: self.not_yet_grafted_last_warn.clone(),
+            l2_cache: self.l2_cache.clone(),
+        }
     }
 
     // (time, snapshot)
@@ -88,8 +114,31 @@ impl OrderBookState {
             None
         } else {
             self.snapped = prevent_future_snaps || self.snapped;
-            Some((self.time, compute_l2_snapshots(&self.order_book)))
+            let start = std::time::Instant::now();
+            let snapshots = self.update_l2_cache();
+            crate::latency::L2_COMPUTE_US.record_duration_us(start.elapsed());
+            Some((self.time, snapshots))
         }
+    }
+
+    /// Recomputes the L2 variants of the books changed since the last call
+    /// (all books on the first call) and returns the whole cache.
+    fn update_l2_cache(&mut self) -> L2Snapshots {
+        let changed = self.order_book.take_changed();
+        let books = self.order_book.as_ref();
+        let stale: Vec<_> = if self.l2_cache.len() == books.len() {
+            changed.iter().filter_map(|coin| books.get_key_value(coin)).collect()
+        } else {
+            books.iter().filter(|(coin, _)| changed.contains(*coin) || !self.l2_cache.contains_key(*coin)).collect()
+        };
+        let fresh: Vec<_> =
+            stale.par_iter().map(|(coin, book)| ((*coin).clone(), Arc::new(compute_coin_l2_snapshots(book)))).collect();
+        self.l2_cache.extend(fresh);
+        if self.l2_cache.len() != books.len() {
+            // Books are never removed today; keep the cache exact regardless.
+            self.l2_cache.retain(|coin, _| books.contains_key(coin));
+        }
+        L2Snapshots(self.l2_cache.clone())
     }
 
     pub(super) fn compute_universe(&self) -> HashSet<Coin> {
@@ -241,5 +290,127 @@ impl OrderBookState {
         self.time = time;
         self.snapped = false;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod real_snapshot_test {
+    use super::*;
+    use crate::{
+        listeners::order_book::utils::compute_l2_snapshots,
+        order_book::multi_book::load_snapshots_from_str,
+        types::{L4Order, inner::InnerLevel},
+    };
+    use alloy::primitives::Address;
+    use std::time::{Duration, Instant};
+
+    const FIXTURE: &str = "tmp/fixture/out.snap.json";
+    /// The 400 hl-node blocks right after FIXTURE's height: alternating
+    /// order-status and book-diff lines (statuses pre-filtered to the ones
+    /// `apply_updates` inserts into the book). Test-only, not committed.
+    const REPLAY_BLOCKS: &str = "tmp/fixture/replay_blocks.jsonl";
+
+    fn same_l2(a: &Snapshot<InnerLevel>, b: &Snapshot<InnerLevel>) -> bool {
+        a.as_ref().iter().zip(b.as_ref()).all(|(a, b)| {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.px == b.px && a.sz == b.sz && a.n == b.n)
+        })
+    }
+
+    /// The incremental L2 cache must equal a full recompute after every real block.
+    #[test]
+    fn incremental_l2_matches_full_recompute_on_real_blocks() {
+        let (Ok(json), Ok(blocks)) = (fs::read_to_string(FIXTURE), fs::read_to_string(REPLAY_BLOCKS)) else {
+            eprintln!("skipping: {FIXTURE} or {REPLAY_BLOCKS} not present");
+            return;
+        };
+        let (height, snapshot) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json).unwrap();
+        drop(json);
+        let mut state = OrderBookState::from_snapshot(snapshot, height, 0, true, true);
+        let first = state.l2_snapshots(true).unwrap().1;
+        assert!(state.l2_snapshots(true).is_none(), "snapped state must not re-snapshot");
+        let mut prev: HashMap<Coin, Arc<CoinL2Snapshots>> = first.as_ref().clone();
+        let n_coins = prev.len();
+        let (mut n_blocks, mut n_recomputed, mut incr_time, mut full_time) = (0, 0, Duration::ZERO, Duration::ZERO);
+        let mut lines = blocks.lines();
+        while let (Some(statuses), Some(diffs)) = (lines.next(), lines.next()) {
+            let statuses: Batch<NodeDataOrderStatus> = serde_json::from_str(statuses).unwrap();
+            let diffs: Batch<NodeDataOrderDiff> = serde_json::from_str(diffs).unwrap();
+            assert_eq!(statuses.block_number(), state.height + 1);
+            state.apply_updates(statuses, diffs).unwrap();
+            n_blocks += 1;
+            if n_blocks == 200 {
+                // A newly-listed coin grafted mid-stream, and an existing book replaced.
+                let btc = state.compute_coin_snapshot(&Coin::new("BTC")).unwrap().2;
+                let sol = state.compute_coin_snapshot(&Coin::new("SOL")).unwrap().2;
+                let extras = HashMap::from([(Coin::new("NEWCOIN"), btc), (Coin::new("SOL"), sol)]);
+                state.absorb_extra_books(extras, true);
+            }
+
+            let start = Instant::now();
+            let (_, incremental) = state.l2_snapshots(true).unwrap();
+            incr_time += start.elapsed();
+            let start = Instant::now();
+            let full = compute_l2_snapshots(&state.order_book);
+            full_time += start.elapsed();
+
+            let (incremental, full) = (incremental.as_ref(), full.as_ref());
+            assert_eq!(incremental.len(), full.len(), "block {}", state.height);
+            for (coin, expected) in full {
+                let got = &incremental[coin];
+                assert_eq!(got.len(), expected.len(), "{coin:?}");
+                for (params, expected) in expected.iter() {
+                    assert!(same_l2(&got[params], expected), "block {} {coin:?} differs", state.height);
+                }
+                match prev.get(coin) {
+                    Some(old) if Arc::ptr_eq(old, got) => {}
+                    _ => n_recomputed += 1,
+                }
+            }
+            prev = incremental.clone();
+        }
+        assert_eq!(n_blocks, 400, "fixture should hold 400 blocks");
+        eprintln!(
+            "{n_blocks} blocks, {n_coins} coins: {:.1} coins recomputed per block; l2 incremental {:?}/block vs full {:?}/block",
+            n_recomputed as f64 / f64::from(n_blocks),
+            incr_time / n_blocks,
+            full_time / n_blocks,
+        );
+    }
+
+    #[test]
+    fn coin_snapshot_and_par_clone_match_full_state() {
+        let Ok(json) = fs::read_to_string(FIXTURE) else {
+            eprintln!("skipping: {FIXTURE} not present");
+            return;
+        };
+        let (height, snapshot) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json).unwrap();
+        drop(json);
+        let mut state = OrderBookState::from_snapshot(snapshot, height, 1234, true, true);
+        state.snapped = true;
+        state.not_yet_grafted_last_warn.insert(Coin::new("NEWCOIN"), 7);
+        let full = state.compute_snapshot();
+        assert!(full.as_ref().len() > 100);
+
+        // Old L4 subscribe path: filter the full snapshot for one coin.
+        for (coin, expected) in full.as_ref() {
+            let (time, h, got) = state.compute_coin_snapshot(coin).unwrap();
+            assert_eq!((time, h), (1234, height));
+            assert_eq!(got.as_ref(), expected.as_ref(), "{coin:?}");
+        }
+        assert!(state.compute_coin_snapshot(&Coin::new("NO_SUCH_COIN")).is_none());
+
+        let (serial, par) = (state.clone(), state.par_clone());
+        for copy in [&serial, &par] {
+            assert_eq!(
+                (copy.height, copy.time, copy.snapped, copy.ignore_spot, copy.allow_initial_gap),
+                (state.height, state.time, state.snapped, state.ignore_spot, state.allow_initial_gap)
+            );
+            assert_eq!(copy.not_yet_grafted_last_warn, state.not_yet_grafted_last_warn);
+        }
+        let (serial, par) = (serial.compute_snapshot(), par.compute_snapshot());
+        assert_eq!(serial.as_ref().len(), par.as_ref().len());
+        for (coin, expected) in serial.as_ref() {
+            assert_eq!(par.as_ref()[coin].as_ref(), expected.as_ref(), "{coin:?}");
+        }
     }
 }

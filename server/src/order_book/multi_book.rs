@@ -5,7 +5,7 @@ use crate::{
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
 };
 use tokio::fs::read_to_string;
@@ -29,6 +29,10 @@ impl<O> Snapshots<O> {
 #[derive(Clone)]
 pub(crate) struct OrderBooks<O> {
     order_books: BTreeMap<Coin, OrderBook<O>>,
+    /// Coins whose book may have changed since the last `take_changed`. Every
+    /// mutating method below must record its coin here: the listener's
+    /// incremental L2 cache only recomputes these.
+    changed: HashSet<Coin>,
 }
 
 impl<O: InnerOrder> OrderBooks<O> {
@@ -43,11 +47,24 @@ impl<O: InnerOrder> OrderBooks<O> {
                 .into_iter()
                 .map(|(coin, book)| (coin, OrderBook::from_snapshot(book, ignore_triggers)))
                 .collect(),
+            changed: HashSet::new(),
         }
+    }
+
+    fn mark_changed(&mut self, coin: &Coin) {
+        if !self.changed.contains(coin) {
+            self.changed.insert(coin.clone());
+        }
+    }
+
+    /// Coins whose book may have changed since the previous call.
+    pub(crate) fn take_changed(&mut self) -> HashSet<Coin> {
+        std::mem::take(&mut self.changed)
     }
 
     pub(crate) fn add_order(&mut self, order: O) {
         let coin = &order.coin();
+        self.mark_changed(coin);
         self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).add_order(order);
     }
 
@@ -57,10 +74,12 @@ impl<O: InnerOrder> OrderBooks<O> {
     /// listener restart. Caller is responsible for ensuring `coin` is not
     /// already tracked.
     pub(crate) fn insert_book(&mut self, coin: Coin, snapshot: Snapshot<O>, ignore_triggers: bool) {
+        self.mark_changed(&coin);
         self.order_books.insert(coin, OrderBook::from_snapshot(snapshot, ignore_triggers));
     }
 
     pub(crate) fn cancel_order(&mut self, oid: Oid, coin: Coin) -> bool {
+        self.mark_changed(&coin);
         self.order_books.get_mut(&coin).is_some_and(|book| book.cancel_order(oid))
     }
 
@@ -74,6 +93,7 @@ impl<O: InnerOrder> OrderBooks<O> {
 
     // change size to reflect how much gets matched during the block
     pub(crate) fn modify_sz(&mut self, oid: Oid, coin: Coin, sz: Sz) -> bool {
+        self.mark_changed(&coin);
         self.order_books.get_mut(&coin).is_some_and(|book| book.modify_sz(oid, sz))
     }
 }
@@ -83,6 +103,15 @@ impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
     pub(crate) fn to_snapshots_par(&self) -> Snapshots<O> {
         let snapshots = self.order_books.par_iter().map(|(c, book)| (c.clone(), book.to_snapshot())).collect();
         Snapshots(snapshots)
+    }
+
+    /// Same result as `clone()`, with the per-coin books cloned in parallel.
+    #[must_use]
+    pub(crate) fn par_clone(&self) -> Self {
+        Self {
+            order_books: self.order_books.par_iter().map(|(c, book)| (c.clone(), book.clone())).collect(),
+            changed: self.changed.clone(),
+        }
     }
 }
 
@@ -356,5 +385,52 @@ mod tests {
             ],
         ];
         assert_eq!(ans, raw_levels);
+    }
+}
+
+#[cfg(test)]
+mod par_clone_test {
+    use super::*;
+    use crate::types::{L4Order, inner::InnerL4Order};
+    use alloy::primitives::Address;
+    use itertools::Itertools;
+    use std::{fs, time::Instant};
+
+    /// Real hl-node L4 snapshot (copy of /root/out.json); test-only, not committed.
+    const FIXTURE: &str = "tmp/fixture/out.snap.json";
+
+    #[test]
+    fn par_clone_matches_clone_on_real_snapshot() {
+        let Ok(json) = fs::read_to_string(FIXTURE) else {
+            eprintln!("skipping: {FIXTURE} not present");
+            return;
+        };
+        let (_, snapshot) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json).unwrap();
+        drop(json);
+        let books = OrderBooks::from_snapshots(snapshot, true);
+        let n_orders: usize = books.order_books.values().map(|b| b.oid_to_side_px.len()).sum();
+        assert!(books.order_books.len() > 100 && n_orders > 100_000, "fixture too small: {n_orders}");
+
+        let start = Instant::now();
+        let serial = books.clone();
+        let serial_time = start.elapsed();
+        let start = Instant::now();
+        let par = books.par_clone();
+        let par_time = start.elapsed();
+        let largest = books.order_books.values().map(|b| b.oid_to_side_px.len()).max().unwrap_or(0);
+        eprintln!(
+            "{} coins, {n_orders} orders (largest book {largest}): clone {serial_time:?}, par_clone {par_time:?} on {} threads",
+            books.order_books.len(),
+            rayon::current_num_threads()
+        );
+
+        assert_eq!(serial.order_books.keys().collect_vec(), par.order_books.keys().collect_vec());
+        for (coin, book) in &serial.order_books {
+            let other = &par.order_books[coin];
+            assert!(book.oid_to_side_px == other.oid_to_side_px, "{coin:?} oid index differs");
+            assert!(book.bids.keys().eq(other.bids.keys()), "{coin:?} bid levels differ");
+            assert!(book.asks.keys().eq(other.asks.keys()), "{coin:?} ask levels differ");
+            assert_eq!(book.to_snapshot().as_ref(), other.to_snapshot().as_ref(), "{coin:?} orders differ");
+        }
     }
 }
