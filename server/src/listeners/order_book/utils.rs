@@ -7,7 +7,7 @@ use crate::{
     },
     prelude::*,
     types::{
-        node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+        node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::MAX_LEVELS,
     },
 };
@@ -272,6 +272,29 @@ pub(super) enum EventBatch {
     Orders(Batch<NodeDataOrderStatus>),
     BookDiffs(Batch<NodeDataOrderDiff>),
     Fills(Batch<NodeDataFill>),
+}
+
+/// Parses one line of an `event_source` file into (block height, batch). An
+/// incomplete line (hl-node still writing it) is an error.
+pub(super) fn parse_event_line(event_source: EventSource, line: &str) -> serde_json::Result<(u64, EventBatch)> {
+    let start = std::time::Instant::now();
+    match event_source {
+        EventSource::Fills => {
+            serde_json::from_str(line).map(|batch: Batch<NodeDataFill>| (batch.block_number(), EventBatch::Fills(batch)))
+        }
+        EventSource::OrderStatuses => {
+            let res = Batch::from_str_par(line)
+                .map(|batch: Batch<NodeDataOrderStatus>| (batch.block_number(), EventBatch::Orders(batch)));
+            crate::latency::STATUSES_PARSE_US.record_duration_us(start.elapsed());
+            res
+        }
+        EventSource::OrderDiffs => {
+            let res = Batch::from_str_par(line)
+                .map(|batch: Batch<NodeDataOrderDiff>| (batch.block_number(), EventBatch::BookDiffs(batch)));
+            crate::latency::DIFFS_PARSE_US.record_duration_us(start.elapsed());
+            res
+        }
+    }
 }
 
 /// Maximum number of unprocessed Batches a single BatchQueue may hold before

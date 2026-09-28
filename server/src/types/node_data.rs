@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use alloy::primitives::Address;
 use chrono::NaiveDateTime;
-use serde::{Deserialize, Serialize};
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::value::RawValue;
 
 use crate::{
     order_book::{Coin, Oid},
@@ -104,5 +106,88 @@ impl<E> Batch<E> {
 
     pub(crate) fn events_ref(&self) -> &[E] {
         &self.events
+    }
+}
+
+/// Lines shorter than this are parsed in one go. `from_str_par` first scans
+/// the line for event boundaries (about a third of a full parse), which only
+/// pays off on large lines.
+const PAR_PARSE_MIN_LINE_LEN: usize = 128 * 1024;
+/// Events per rayon task in `from_str_par`.
+const PAR_PARSE_MIN_EVENTS: usize = 16;
+
+/// A batch line with its events left unparsed.
+#[derive(Deserialize)]
+struct RawBatch<'a> {
+    local_time: NaiveDateTime,
+    block_time: NaiveDateTime,
+    block_number: u64,
+    #[serde(borrow)]
+    events: Vec<&'a RawValue>,
+}
+
+impl<E: DeserializeOwned + Send> Batch<E> {
+    /// Same result as `serde_json::from_str`, with the events of a large line
+    /// parsed in parallel. Order-status lines are ~1 MB at the US open, and
+    /// parsing them serially was 3.3 ms p50 / 13 ms p99 of the listener's
+    /// time per block (2026-09-28). A torn (incomplete) line still fails.
+    pub(crate) fn from_str_par(line: &str) -> serde_json::Result<Self> {
+        Self::from_str_par_above(line, PAR_PARSE_MIN_LINE_LEN)
+    }
+
+    fn from_str_par_above(line: &str, min_line_len: usize) -> serde_json::Result<Self> {
+        if line.len() < min_line_len {
+            return serde_json::from_str(line);
+        }
+        let RawBatch { local_time, block_time, block_number, events } = serde_json::from_str(line)?;
+        let events = events
+            .par_iter()
+            .with_min_len(PAR_PARSE_MIN_EVENTS)
+            .map(|event| serde_json::from_str(event.get()))
+            .collect::<serde_json::Result<Vec<E>>>()?;
+        Ok(Self { local_time, block_time, block_number, events })
+    }
+}
+
+#[cfg(test)]
+mod par_parse_test {
+    use super::*;
+    use std::{fs, time::Instant};
+
+    /// Unfiltered hl-node order-status / order-diff lines (100 blocks each); test-only, not committed.
+    const RAW_STATUSES: &str = "tmp/fixture/obs_raw_statuses.jsonl";
+    const RAW_DIFFS: &str = "tmp/fixture/obs_raw_diffs.jsonl";
+
+    fn check<E: DeserializeOwned + Send + Serialize>(path: &str) {
+        let Ok(lines) = fs::read_to_string(path) else {
+            eprintln!("skipping: {path} not present");
+            return;
+        };
+        let (mut serial_time, mut par_time, mut n) = (std::time::Duration::ZERO, std::time::Duration::ZERO, 0);
+        for line in lines.lines() {
+            let start = Instant::now();
+            let serial: Batch<E> = serde_json::from_str(line).unwrap();
+            serial_time += start.elapsed();
+            let start = Instant::now();
+            let par = Batch::<E>::from_str_par(line).unwrap();
+            par_time += start.elapsed();
+            let forced = Batch::<E>::from_str_par_above(line, 0).unwrap();
+            let expected = serde_json::to_string(&serial).unwrap();
+            assert_eq!(serde_json::to_string(&par).unwrap(), expected);
+            assert_eq!(serde_json::to_string(&forced).unwrap(), expected);
+            // hl-node may not have finished writing the line yet.
+            for cut in [1, line.len() / 3, line.len() / 2, line.len() - 1] {
+                assert!(Batch::<E>::from_str_par_above(&line[..cut], 0).is_err(), "{path}: cut at {cut}");
+            }
+            n += 1;
+        }
+        assert!(n > 0, "{path}: no lines");
+        eprintln!("{path}: {n} lines, serial {:?}/line, from_str_par {:?}/line", serial_time / n, par_time / n);
+    }
+
+    #[test]
+    fn par_parse_matches_serde_on_raw_lines() {
+        check::<NodeDataOrderStatus>(RAW_STATUSES);
+        check::<NodeDataOrderDiff>(RAW_DIFFS);
     }
 }

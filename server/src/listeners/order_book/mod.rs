@@ -75,7 +75,7 @@ const PARSE_FAIL_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How often the lag watchdog runs. Independent of fs activity.
 const WATCHDOG_INTERVAL_SECS: u64 = 15;
-use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
+use utils::{BatchQueue, EventBatch, parse_event_line, process_rmp_file, validate_snapshot_consistency};
 pub(crate) use l2_demand::{ClientL2Demand, L2Demand};
 #[cfg(test)]
 pub(crate) use utils::compute_l2_snapshots;
@@ -863,16 +863,7 @@ impl DirectoryListener for OrderBookListener {
             if line.is_empty() {
                 continue;
             }
-            let res = match event_source {
-                EventSource::Fills => serde_json::from_str::<Batch<NodeDataFill>>(line).map(|batch| {
-                    let height = batch.block_number();
-                    (height, EventBatch::Fills(batch))
-                }),
-                EventSource::OrderStatuses => serde_json::from_str(line)
-                    .map(|batch: Batch<NodeDataOrderStatus>| (batch.block_number(), EventBatch::Orders(batch))),
-                EventSource::OrderDiffs => serde_json::from_str(line)
-                    .map(|batch: Batch<NodeDataOrderDiff>| (batch.block_number(), EventBatch::BookDiffs(batch))),
-            };
+            let res = parse_event_line(event_source, line);
             let (height, event_batch) = match res {
                 Ok(data) => data,
                 Err(err) => {
@@ -1010,16 +1001,7 @@ impl OrderBookListener {
             if line.is_empty() {
                 continue;
             }
-            let res = match event_source {
-                EventSource::Fills => serde_json::from_str::<Batch<NodeDataFill>>(&line).map(|batch| {
-                    let height = batch.block_number();
-                    (height, EventBatch::Fills(batch))
-                }),
-                EventSource::OrderStatuses => serde_json::from_str(&line)
-                    .map(|batch: Batch<NodeDataOrderStatus>| (batch.block_number(), EventBatch::Orders(batch))),
-                EventSource::OrderDiffs => serde_json::from_str(&line)
-                    .map(|batch: Batch<NodeDataOrderDiff>| (batch.block_number(), EventBatch::BookDiffs(batch))),
-            };
+            let res = parse_event_line(event_source, &line);
             match res {
                 Ok((height, event_batch)) => {
                     if height % 1000 == 0 {
