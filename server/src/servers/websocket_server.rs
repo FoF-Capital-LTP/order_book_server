@@ -37,7 +37,19 @@ use yawc::{FrameView, OpCode, WebSocket};
 /// read them, so the backlog only holds memory while some client is behind.
 const BROADCAST_CAPACITY: usize = 1024;
 
+/// Rayon threads for the per-block L2 recompute and the snapshot-validation clone,
+/// unless RAYON_NUM_THREADS is set. Rayon's default of one per core (32 on the node)
+/// cost ~12% of obs CPU in idle spinning (crossbeam_epoch, sched_yield; perf 2026-09-28).
+const DEFAULT_RAYON_THREADS: usize = 16;
+
 pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_level: u32) -> Result<()> {
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        let threads = DEFAULT_RAYON_THREADS.min(std::thread::available_parallelism().map_or(1, usize::from));
+        if let Err(err) = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global() {
+            warn!("Could not set rayon threads to {threads}: {err}");
+        }
+    }
+    info!("rayon threads: {}", rayon::current_num_threads());
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(BROADCAST_CAPACITY);
 
     // Central task: listen to messages and forward them for distribution
