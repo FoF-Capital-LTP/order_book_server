@@ -76,9 +76,11 @@ const PARSE_FAIL_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the lag watchdog runs. Independent of fs activity.
 const WATCHDOG_INTERVAL_SECS: u64 = 15;
 use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
+pub(crate) use l2_demand::{ClientL2Demand, L2Demand};
 #[cfg(test)]
 pub(crate) use utils::compute_l2_snapshots;
 
+mod l2_demand;
 mod state;
 mod utils;
 
@@ -483,6 +485,8 @@ pub(crate) struct OrderBookListener {
     last_applied_local_time_us: u64,
     /// Of the last L2 snapshot message: tells the next one which frames clients want.
     last_snapshot_shared: Option<Arc<SnapshotShared>>,
+    /// Coins whose sig-fig L2 variants some client subscribes to.
+    l2_demand: Arc<L2Demand>,
 }
 
 /// Plan E: tracks "stuck on the same byte offset" state for a single
@@ -536,7 +540,12 @@ impl OrderBookListener {
             parse_fail_order_diffs: ParseFailureTracker::default(),
             last_applied_local_time_us: 0,
             last_snapshot_shared: None,
+            l2_demand: Arc::default(),
         }
+    }
+
+    pub(crate) fn l2_demand(&self) -> Arc<L2Demand> {
+        self.l2_demand.clone()
     }
 
     /// Plan E: borrow the per-source parse-failure tracker.
@@ -758,7 +767,8 @@ impl OrderBookListener {
 
     // prevent snapshotting mutiple times at the same height
     fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
-        self.order_book_state.as_mut().and_then(|o| o.l2_snapshots(prevent_future_snaps))
+        let state = self.order_book_state.as_mut()?;
+        state.l2_snapshots(prevent_future_snaps, &self.l2_demand.coins())
     }
 }
 

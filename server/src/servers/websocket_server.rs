@@ -1,7 +1,7 @@
 use crate::{
     latency,
     listeners::order_book::{
-        InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, hl_listen,
+        ClientL2Demand, InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, hl_listen,
     },
     order_book::{Coin, Side},
     prelude::*,
@@ -128,10 +128,14 @@ async fn handle_socket(
     ignore_spot: bool,
 ) {
     let mut internal_message_rx = internal_message_tx.subscribe();
-    let is_ready = listener.lock().await.is_ready();
+    let (is_ready, mut universe, l2_demand) = {
+        let listener = listener.lock().await;
+        let universe: Arc<HashSet<String>> = Arc::new(listener.universe().into_iter().map(|c| c.value()).collect());
+        (listener.is_ready(), universe, listener.l2_demand())
+    };
     let mut manager = SubscriptionManager::default();
-    let mut universe: Arc<HashSet<String>> =
-        Arc::new(listener.lock().await.universe().into_iter().map(|c| c.value()).collect());
+    // Dropped on every return below, which releases this client's sig-fig L2 demand.
+    let mut l2_demand = ClientL2Demand::new(l2_demand);
     if !is_ready {
         let msg = ServerResponse::Error("Order book not ready for streaming (waiting for snapshot)".to_string());
         send_socket_message(&mut socket, msg).await;
@@ -144,18 +148,19 @@ async fn handle_socket(
                     Ok(msg) => {
                         latency::CLIENT_QUEUE_LEN.record(internal_message_rx.len() as u64);
                         let handle_start = Instant::now();
-                        // (histogram, hl-node write time) if this client subscribes to the stream
-                        let delivered = match msg.as_ref() {
+                        // (histogram, hl-node write time) for each stream of this message the client subscribes to
+                        let delivered: [Option<(&latency::Histogram, u64)>; 2] = match msg.as_ref() {
                             InternalMessage::Snapshot{ l2_snapshots, time, local_time_us, shared } => {
                                 universe = shared.universe(l2_snapshots, ignore_spot);
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots, *time, shared).await;
                                 }
-                                manager
+                                let l2 = manager
                                     .subscriptions()
                                     .iter()
                                     .any(|sub| matches!(sub, Subscription::L2Book { .. }))
-                                    .then_some((&latency::CLIENT_L2_AFTER_WRITE_US, *local_time_us))
+                                    .then_some((&latency::CLIENT_L2_AFTER_WRITE_US, *local_time_us));
+                                [l2, None]
                             },
                             InternalMessage::Fills{ batch } => {
                                 let wanted = WantedKeys::new(manager.subscriptions());
@@ -165,8 +170,9 @@ async fn handle_socket(
                                     send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
                                     send_ws_data_from_user_fills(&mut socket, sub, &mut user_fills).await;
                                 }
-                                (wanted.trades || !wanted.user_fills.is_empty())
-                                    .then(|| (&latency::CLIENT_FILLS_AFTER_WRITE_US, batch.local_time_us()))
+                                let fills = (wanted.trades || !wanted.user_fills.is_empty())
+                                    .then(|| (&latency::CLIENT_FILLS_AFTER_WRITE_US, batch.local_time_us()));
+                                [fills, None]
                             },
                             InternalMessage::L4BookUpdates{ diff_batch, status_batch } => {
                                 let wanted = WantedKeys::new(manager.subscriptions());
@@ -176,17 +182,19 @@ async fn handle_socket(
                                     send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
                                     send_ws_data_from_order_updates(&mut socket, sub, &mut user_orders).await;
                                 }
-                                (!wanted.l4_books.is_empty() || !wanted.order_updates.is_empty()).then(|| {
-                                    let local_time_us = diff_batch.local_time_us().max(status_batch.local_time_us());
-                                    (&latency::CLIENT_L4_AFTER_WRITE_US, local_time_us)
-                                })
+                                let local_time_us = diff_batch.local_time_us().max(status_batch.local_time_us());
+                                [
+                                    (!wanted.l4_books.is_empty()).then_some((&latency::CLIENT_L4_AFTER_WRITE_US, local_time_us)),
+                                    (!wanted.order_updates.is_empty())
+                                        .then_some((&latency::CLIENT_ORDER_UPDATES_AFTER_WRITE_US, local_time_us)),
+                                ]
                             },
                         };
                         if let Err(err) = socket.flush().await {
                             error!("Failed to send: {err}");
                         }
                         latency::CLIENT_HANDLE_US.record_duration_us(handle_start.elapsed());
-                        if let Some((histogram, local_time_us)) = delivered {
+                        for (histogram, local_time_us) in delivered.into_iter().flatten() {
                             histogram.record_age_us(local_time_us);
                         }
 
@@ -244,6 +252,7 @@ async fn handle_socket(
                                 }
                                 Ok(value) => {
                                     receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone()).await;
+                                    l2_demand.sync(manager.subscriptions());
                                 }
                                 Err(_) => {
                                     let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
@@ -426,12 +435,13 @@ async fn send_ws_data_from_snapshot(
 ) {
     if let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription {
         let key = (coin.clone(), *n_sig_figs, *mantissa, n_levels.unwrap_or(DEFAULT_LEVELS));
-        let known = l2_snapshots
-            .as_ref()
-            .get(&Coin::new(coin))
-            .is_some_and(|coin_snapshots| coin_snapshots.contains_key(&L2SnapshotParams::new(*n_sig_figs, *mantissa)));
-        if !known {
+        let Some(coin_snapshots) = l2_snapshots.as_ref().get(&Coin::new(coin)) else {
             error!("Coin {coin} not found");
+            return;
+        };
+        // Sig-fig variants are only computed while some client wants them (see
+        // `L2Demand`); this snapshot may predate the subscription. The next has it.
+        if !coin_snapshots.contains_key(&L2SnapshotParams::new(*n_sig_figs, *mantissa)) {
             return;
         }
         if let Some(frame) = shared.l2_frame(key, |key| build_l2_frame(l2_snapshots, key, time)) {

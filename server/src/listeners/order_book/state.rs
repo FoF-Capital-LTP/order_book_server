@@ -1,5 +1,8 @@
 use crate::{
-    listeners::order_book::{CoinL2Snapshots, L2Snapshots, utils::compute_coin_l2_snapshots},
+    listeners::order_book::{
+        CoinL2Snapshots, L2Snapshots,
+        utils::{compute_coin_l2_snapshots, compute_coin_raw_l2_snapshot},
+    },
     order_book::{
         Coin, InnerOrder, Oid, Px, Snapshot,
         multi_book::{OrderBooks, Snapshots},
@@ -114,31 +117,59 @@ impl OrderBookState {
         }
     }
 
-    // (time, snapshot)
-    pub(super) fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
+    // (time, snapshot). Coins in `aggregated` get every L2 variant, the rest only the raw one.
+    pub(super) fn l2_snapshots(
+        &mut self,
+        prevent_future_snaps: bool,
+        aggregated: &HashSet<Coin>,
+    ) -> Option<(u64, L2Snapshots)> {
         if self.snapped {
             None
         } else {
             self.snapped = prevent_future_snaps || self.snapped;
             let start = std::time::Instant::now();
-            let snapshots = self.update_l2_cache();
+            let snapshots = self.update_l2_cache(aggregated);
             crate::latency::L2_COMPUTE_US.record_duration_us(start.elapsed());
+            crate::latency::L2_AGGREGATED_COINS.record(aggregated.len() as u64);
             Some((self.time, snapshots))
         }
     }
 
     /// Recomputes the L2 variants of the books changed since the last call
-    /// (all books on the first call) and returns the whole cache.
-    fn update_l2_cache(&mut self) -> L2Snapshots {
+    /// (all books on the first call), plus coins in `aggregated` whose entry
+    /// has only the raw variant, and returns the whole cache. Every entry is
+    /// computed in one go from the book as of its last change, so a coin that
+    /// drops out of `aggregated` may keep correct aggregated variants until
+    /// its book next changes.
+    fn update_l2_cache(&mut self, aggregated: &HashSet<Coin>) -> L2Snapshots {
         let changed = self.order_book.take_changed();
         let books = self.order_book.as_ref();
+        let lacks_aggregates = |coin: &Coin, entry: &CoinL2Snapshots| entry.len() == 1 && aggregated.contains(coin);
         let stale: Vec<_> = if self.l2_cache.len() == books.len() {
-            changed.iter().filter_map(|coin| books.get_key_value(coin)).collect()
+            let lacking = aggregated.iter().filter(|coin| {
+                !changed.contains(*coin) && self.l2_cache.get(*coin).is_some_and(|entry| lacks_aggregates(coin, entry))
+            });
+            changed.iter().chain(lacking).filter_map(|coin| books.get_key_value(coin)).collect()
         } else {
-            books.iter().filter(|(coin, _)| changed.contains(*coin) || !self.l2_cache.contains_key(*coin)).collect()
+            books
+                .iter()
+                .filter(|(coin, _)| {
+                    changed.contains(*coin)
+                        || self.l2_cache.get(*coin).is_none_or(|entry| lacks_aggregates(coin, entry))
+                })
+                .collect()
         };
-        let fresh: Vec<_> =
-            stale.par_iter().map(|(coin, book)| ((*coin).clone(), Arc::new(compute_coin_l2_snapshots(book)))).collect();
+        let fresh: Vec<_> = stale
+            .par_iter()
+            .map(|(coin, book)| {
+                let snapshots = if aggregated.contains(*coin) {
+                    compute_coin_l2_snapshots(book)
+                } else {
+                    compute_coin_raw_l2_snapshot(book)
+                };
+                ((*coin).clone(), Arc::new(snapshots))
+            })
+            .collect();
         self.l2_cache.extend(fresh);
         if self.l2_cache.len() != books.len() {
             // Books are never removed today; keep the cache exact regardless.
@@ -328,7 +359,8 @@ mod real_snapshot_test {
         })
     }
 
-    /// The incremental L2 cache must equal a full recompute after every real block.
+    /// The incremental L2 cache must equal a full recompute after every real block,
+    /// with sig-fig variants present for every coin some client wants them for.
     #[test]
     fn incremental_l2_matches_full_recompute_on_real_blocks() {
         let (Ok(json), Ok(blocks)) = (fs::read_to_string(FIXTURE), fs::read_to_string(REPLAY_BLOCKS)) else {
@@ -338,12 +370,16 @@ mod real_snapshot_test {
         let (height, snapshot) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json).unwrap();
         drop(json);
         let mut state = OrderBookState::from_snapshot(snapshot, height, 0, true, true);
-        let first = state.l2_snapshots(true).unwrap().1;
-        assert!(state.l2_snapshots(true).is_none(), "snapped state must not re-snapshot");
+        let coins = |names: &[&str]| names.iter().map(|c| Coin::new(c)).collect::<HashSet<_>>();
+        // Demand changes mid-stream: SOL and a quiet coin join at block 100, ETH leaves at 300.
+        let mut aggregated = coins(&["BTC", "ETH"]);
+        let first = state.l2_snapshots(true, &aggregated).unwrap().1;
+        assert!(state.l2_snapshots(true, &aggregated).is_none(), "snapped state must not re-snapshot");
+        assert_eq!(first.as_ref().values().filter(|e| e.len() > 1).count(), 2);
         let mut prev: HashMap<Coin, Arc<CoinL2Snapshots>> = first.as_ref().clone();
         let n_coins = prev.len();
         let (mut n_blocks, mut n_recomputed, mut incr_time, mut full_time) = (0, 0, Duration::ZERO, Duration::ZERO);
-        let (mut n_insert_before, mut n_ahead_checked) = (0, 0);
+        let (mut n_insert_before, mut n_ahead_checked, mut n_aggregated_entries) = (0, 0, 0);
         let mut lines = blocks.lines();
         while let (Some(statuses), Some(diffs)) = (lines.next(), lines.next()) {
             let statuses: Batch<NodeDataOrderStatus> = serde_json::from_str(statuses).unwrap();
@@ -374,8 +410,16 @@ mod real_snapshot_test {
                 state.absorb_extra_books(extras, true);
             }
 
+            if n_blocks == 100 {
+                // The quietest coin: its book likely does not change for a while.
+                let quiet = state.order_book.as_ref().iter().min_by_key(|(_, b)| b.to_snapshot().as_ref().iter().map(Vec::len).sum::<usize>()).unwrap().0;
+                aggregated.extend([Coin::new("SOL"), quiet.clone()]);
+            }
+            if n_blocks == 300 {
+                aggregated.remove(&Coin::new("ETH"));
+            }
             let start = Instant::now();
-            let (_, incremental) = state.l2_snapshots(true).unwrap();
+            let (_, incremental) = state.l2_snapshots(true, &aggregated).unwrap();
             incr_time += start.elapsed();
             let start = Instant::now();
             let full = compute_l2_snapshots(&state.order_book);
@@ -385,10 +429,13 @@ mod real_snapshot_test {
             assert_eq!(incremental.len(), full.len(), "block {}", state.height);
             for (coin, expected) in full {
                 let got = &incremental[coin];
-                assert_eq!(got.len(), expected.len(), "{coin:?}");
-                for (params, expected) in expected.iter() {
-                    assert!(same_l2(&got[params], expected), "block {} {coin:?} differs", state.height);
+                // Wanted coins have every variant; others the raw one, or every variant
+                // (correct for the current book) until the book next changes.
+                assert!(got.len() == expected.len() || (got.len() == 1 && !aggregated.contains(coin)), "{coin:?}");
+                for (params, got) in got.iter() {
+                    assert!(same_l2(got, &expected[params]), "block {} {coin:?} {params:?} differs", state.height);
                 }
+                n_aggregated_entries += usize::from(got.len() > 1);
                 match prev.get(coin) {
                     Some(old) if Arc::ptr_eq(old, got) => {}
                     _ => n_recomputed += 1,
@@ -404,9 +451,8 @@ mod real_snapshot_test {
                 for (coin, book) in state.order_book.as_ref() {
                     let got = &incremental[coin];
                     let expected = compute_coin_l2_snapshots_full_depth(book);
-                    assert_eq!(got.len(), expected.len(), "{coin:?}");
-                    for (params, expected) in &expected {
-                        let (got, expected) = (&got[params], expected.truncate(MAX_LEVELS));
+                    for (params, got) in got.iter() {
+                        let expected = expected[params].truncate(MAX_LEVELS);
                         assert!(got.as_ref().iter().all(|side| side.len() <= MAX_LEVELS));
                         assert!(same_l2(got, &expected), "block {} {coin:?} {params:?} differs", state.height);
                     }
@@ -414,12 +460,15 @@ mod real_snapshot_test {
             }
         }
         assert_eq!(n_blocks, 400, "fixture should hold 400 blocks");
+        assert_eq!(state.l2_cache[&Coin::new("ETH")].len(), 1, "ETH lost its demand and changed since");
+        assert!(aggregated.iter().all(|coin| state.l2_cache[coin].len() > 1));
         assert_eq!(INSERT_BEFORE_MISSES.load(Ordering::Relaxed), 0, "every insertBefore anchor should be on the book");
         assert!(n_ahead_checked > 0);
         eprintln!("{n_insert_before} insertBefore diffs, {n_ahead_checked} checked queued ahead of their anchor");
         eprintln!(
-            "{n_blocks} blocks, {n_coins} coins: {:.1} coins recomputed per block; l2 incremental {:?}/block vs full {:?}/block",
+            "{n_blocks} blocks, {n_coins} coins: {:.1} coins recomputed, {:.1} with sig-fig variants per block; l2 incremental {:?}/block vs full {:?}/block",
             n_recomputed as f64 / f64::from(n_blocks),
+            n_aggregated_entries as f64 / f64::from(n_blocks),
             incr_time / n_blocks,
             full_time / n_blocks,
         );

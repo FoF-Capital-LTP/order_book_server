@@ -217,6 +217,12 @@ pub(super) fn compute_coin_l2_snapshots<O: InnerOrder>(order_book: &OrderBook<O>
     ])
 }
 
+/// Only the raw variant (`n_sig_figs` and `mantissa` None) of one book, for
+/// coins nobody wants aggregated; see `l2_demand`.
+pub(super) fn compute_coin_raw_l2_snapshot<O: InnerOrder>(order_book: &OrderBook<O>) -> CoinL2Snapshots {
+    HashMap::from([(L2SnapshotParams::new(None, None), order_book.to_l2_snapshot(Some(MAX_LEVELS), None, None))])
+}
+
 /// The pre-2026-09-28 `compute_coin_l2_snapshots`: every variant at full depth.
 #[cfg(test)]
 pub(crate) fn compute_coin_l2_snapshots_full_depth<O: InnerOrder>(order_book: &OrderBook<O>) -> CoinL2Snapshots {

@@ -107,28 +107,42 @@ pub(crate) static LOCK_HOLD_US: Histogram = Histogram::new("listener_lock_hold_u
 pub(crate) static SNAPSHOT_CLONE_US: Histogram = Histogram::new("snapshot_clone_us");
 /// Snapshot-validation catch-up and comparison, once per 60 s fetch (blocking pool, no mutex).
 pub(crate) static SNAPSHOT_VALIDATE_US: Histogram = Histogram::new("snapshot_validate_us");
+/// JSON parse of one order-statuses / order-diffs line (runs under the listener mutex).
+pub(crate) static STATUSES_PARSE_US: Histogram = Histogram::new("statuses_parse_us");
+pub(crate) static DIFFS_PARSE_US: Histogram = Histogram::new("diffs_parse_us");
+/// apply_updates of one block (runs under the listener mutex).
+pub(crate) static APPLY_US: Histogram = Histogram::new("apply_us");
 /// compute_l2_snapshots duration (runs under the listener mutex).
 pub(crate) static L2_COMPUTE_US: Histogram = Histogram::new("l2_compute_us");
+/// Coins some client wants a sig-fig L2 variant of, per L2 compute.
+pub(crate) static L2_AGGREGATED_COINS: Histogram = Histogram::new("l2_aggregated_coins");
 /// Wall clock minus hl-node local_time when a client with a matching
 /// subscription has finished sending that block's message, per stream.
 pub(crate) static CLIENT_L2_AFTER_WRITE_US: Histogram = Histogram::new("client_l2_after_write_us");
 pub(crate) static CLIENT_L4_AFTER_WRITE_US: Histogram = Histogram::new("client_l4_after_write_us");
+pub(crate) static CLIENT_ORDER_UPDATES_AFTER_WRITE_US: Histogram =
+    Histogram::new("client_order_updates_after_write_us");
 pub(crate) static CLIENT_FILLS_AFTER_WRITE_US: Histogram = Histogram::new("client_fills_after_write_us");
 /// Time a client task spends handling one broadcast message (filtering, serializing, sending).
 pub(crate) static CLIENT_HANDLE_US: Histogram = Histogram::new("client_handle_us");
 /// Messages still queued for a client when it receives one; it is disconnected once this passes 100.
 pub(crate) static CLIENT_QUEUE_LEN: Histogram = Histogram::new("client_queue_len");
 
-static ALL: [&Histogram; 12] = [
+static ALL: [&Histogram; 17] = [
     &HL_WRITE_LAG_MS,
     &APPLY_AFTER_WRITE_US,
     &LOCK_WAIT_US,
     &LOCK_HOLD_US,
     &SNAPSHOT_CLONE_US,
     &SNAPSHOT_VALIDATE_US,
+    &STATUSES_PARSE_US,
+    &DIFFS_PARSE_US,
+    &APPLY_US,
     &L2_COMPUTE_US,
+    &L2_AGGREGATED_COINS,
     &CLIENT_L2_AFTER_WRITE_US,
     &CLIENT_L4_AFTER_WRITE_US,
+    &CLIENT_ORDER_UPDATES_AFTER_WRITE_US,
     &CLIENT_FILLS_AFTER_WRITE_US,
     &CLIENT_HANDLE_US,
     &CLIENT_QUEUE_LEN,
