@@ -681,10 +681,28 @@ impl OrderBookListener {
         }
         if self.is_ready() {
             if let Some((order_statuses, order_diffs)) = self.pop_cache() {
-                self.order_book_state
-                    .as_mut()
-                    .map(|book| book.apply_updates(&order_statuses, &order_diffs))
-                    .transpose()?;
+                let msg = Arc::new(InternalMessage::L4BookUpdates { diff_batch: order_diffs, status_batch: order_statuses });
+                let InternalMessage::L4BookUpdates { diff_batch: order_diffs, status_batch: order_statuses } = msg.as_ref()
+                else {
+                    unreachable!()
+                };
+                let Some(state) = self.order_book_state.as_mut() else { return Ok(()) };
+                // Clients build L4 and orderUpdates messages from the batches alone, so send
+                // before applying: apply_updates took 3.8 ms p50 / 18 ms p99 (2026-09-28).
+                // Still under the listener mutex, so an L4 subscribe snapshot cannot fall
+                // between the send and the apply. A gap resyncs the state: nothing to send.
+                // Broadcast sends are sync and never block, so send in place rather than
+                // tokio::spawn: a task spawned from here sat in this worker's unstealable
+                // LIFO slot until the listener released the worker (after compute_l2_snapshots),
+                // adding ~15 ms to L4 delivery (measured 2026-09-27). Also keeps message order.
+                if !state.is_gap(order_statuses.block_number()) {
+                    if let Some(tx) = &self.internal_message_tx {
+                        let _unused = tx.send(msg.clone());
+                    }
+                }
+                let apply_start = std::time::Instant::now();
+                state.apply_updates(order_statuses, order_diffs)?;
+                latency::APPLY_US.record_duration_us(apply_start.elapsed());
                 // The block is only usable once both files have it, so the later write counts.
                 let local_time_us = order_statuses.local_time_us().max(order_diffs.local_time_us());
                 latency::APPLY_AFTER_WRITE_US.record_age_us(local_time_us);
@@ -692,16 +710,6 @@ impl OrderBookListener {
                 self.last_applied_local_time_us = local_time_us;
                 if let Some(cache) = &mut self.fetched_snapshot_cache {
                     cache.push_back((order_statuses.clone(), order_diffs.clone()));
-                }
-                // Broadcast sends are sync and never block, so send in place rather than
-                // tokio::spawn: a task spawned from here sat in this worker's unstealable
-                // LIFO slot until the listener released the worker (after compute_l2_snapshots),
-                // adding ~15 ms to L4 delivery (measured 2026-09-27). Also keeps message order.
-                if let Some(tx) = &self.internal_message_tx {
-                    let _unused = tx.send(Arc::new(InternalMessage::L4BookUpdates {
-                        diff_batch: order_diffs,
-                        status_batch: order_statuses,
-                    }));
                 }
             }
         }
@@ -1154,5 +1162,35 @@ mod validation_test {
         // A snapshot that does not match the caught-up state.
         let validation = catch_up_and_validate(state.par_clone(), cache(20), target, state.compute_snapshot(), true);
         assert!(matches!(validation, Validation::Mismatch), "{validation:?}");
+    }
+
+    /// L4 updates go out for every applied block (they are sent before the apply), never for a gap.
+    #[test]
+    fn l4_updates_sent_for_applied_blocks_only() {
+        let (Ok(json), Ok(blocks)) = (fs::read_to_string(FIXTURE), fs::read_to_string(REPLAY_BLOCKS)) else {
+            eprintln!("skipping: {FIXTURE} or {REPLAY_BLOCKS} not present");
+            return;
+        };
+        let (height, snapshot) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json).unwrap();
+        drop(json);
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let mut listener = OrderBookListener::new(Some(tx), true);
+        listener.order_book_state = Some(OrderBookState::from_snapshot(snapshot, height, 0, true, true));
+        let lines = blocks.lines().collect::<Vec<_>>();
+        let mut feed = |block: usize| {
+            listener.receive_batch(EventBatch::Orders(serde_json::from_str(lines[2 * block]).unwrap())).unwrap();
+            listener.receive_batch(EventBatch::BookDiffs(serde_json::from_str(lines[2 * block + 1]).unwrap()))
+        };
+        for block in 0..3 {
+            feed(block).unwrap();
+            let msg = rx.try_recv().unwrap();
+            let InternalMessage::L4BookUpdates { status_batch, diff_batch } = msg.as_ref() else { panic!("not L4") };
+            assert_eq!((status_batch.block_number(), diff_batch.block_number()), (height + 1 + block as u64, height + 1 + block as u64));
+        }
+        // Block height+5 after height+3: a gap resyncs instead of sending.
+        let err = feed(4).unwrap_err();
+        assert!(err.to_string().contains("[gap-grace-resync]"), "{err}");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(listener.order_book_state.as_ref().unwrap().height(), height + 3);
     }
 }

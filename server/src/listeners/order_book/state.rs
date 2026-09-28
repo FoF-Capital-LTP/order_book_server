@@ -200,6 +200,12 @@ impl OrderBookState {
         }
     }
 
+    /// True if a block at `height` would skip blocks; `apply_updates` then fails with
+    /// "[gap-grace-resync]" without changing the books.
+    pub(super) const fn is_gap(&self, height: u64) -> bool {
+        height > self.height + 1
+    }
+
     pub(super) fn apply_updates(
         &mut self,
         order_statuses: &Batch<NodeDataOrderStatus>,
@@ -208,7 +214,7 @@ impl OrderBookState {
         let height = order_statuses.block_number();
         let time = order_statuses.block_time();
         assert_eq!(order_statuses.block_number(), order_diffs.block_number());
-        if height > self.height + 1 {
+        if self.is_gap(height) {
             let gap_blocks = height.saturating_sub(self.height);
             if self.allow_initial_gap {
                 // First gap after snapshot init — expected when the consumer
