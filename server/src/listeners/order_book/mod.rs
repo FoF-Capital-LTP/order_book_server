@@ -317,7 +317,7 @@ fn fetch_snapshot(
                             let mut catch_up_failed = false;
                             while state.height() < height {
                                 if let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                                    if let Err(err) = state.apply_updates(order_statuses, order_diffs) {
+                                    if let Err(err) = state.apply_updates(&order_statuses, &order_diffs) {
                                         // Gap or other error during validation
                                         // catch-up — the main loop already
                                         // handled this (e.g. gap-grace-resync
@@ -645,7 +645,7 @@ impl OrderBookListener {
             if let Some((order_statuses, order_diffs)) = self.pop_cache() {
                 self.order_book_state
                     .as_mut()
-                    .map(|book| book.apply_updates(order_statuses.clone(), order_diffs.clone()))
+                    .map(|book| book.apply_updates(&order_statuses, &order_diffs))
                     .transpose()?;
                 // The block is only usable once both files have it, so the later write counts.
                 let local_time_us = order_statuses.local_time_us().max(order_diffs.local_time_us());
@@ -684,7 +684,7 @@ impl OrderBookListener {
         let mut new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
         let mut retry = false;
         while let Some((order_statuses, order_diffs)) = self.pop_cache() {
-            if new_order_book.apply_updates(order_statuses, order_diffs).is_err() {
+            if new_order_book.apply_updates(&order_statuses, &order_diffs).is_err() {
                 info!(
                     "Failed to apply updates to this book (likely missing older updates). Waiting for next snapshot."
                 );
@@ -1054,7 +1054,7 @@ pub(crate) enum InternalMessage {
     L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
 }
 
-#[derive(Eq, PartialEq, Hash)]
+#[derive(Debug, Eq, PartialEq, Hash)]
 pub(crate) struct L2SnapshotParams {
     n_sig_figs: Option<u32>,
     mantissa: Option<u64>,

@@ -1,7 +1,7 @@
 use crate::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
-use std::ops::Add;
+use std::ops::{Add, Sub};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum Side {
@@ -93,6 +93,14 @@ impl Add<Self> for Sz {
 
     fn add(self, rhs: Self) -> Self {
         Self(self.0 + rhs.0)
+    }
+}
+
+impl Sub<Self> for Sz {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self {
+        Self(self.0 - rhs.0)
     }
 }
 

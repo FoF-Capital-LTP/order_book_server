@@ -8,6 +8,7 @@ use crate::{
     prelude::*,
     types::{
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+        subscription::MAX_LEVELS,
     },
 };
 use log::warn;
@@ -181,7 +182,33 @@ impl L2SnapshotParams {
 }
 
 /// All L2 variants (full depth, 5 sig figs with mantissa None/2/5, then 4, 3, 2 sig figs) of one book.
+/// Clients get at most `MAX_LEVELS` levels, so only that many are stored per
+/// variant. Each variant is still derived from the same untruncated parent as
+/// before: a coarser bucket spans many finer ones, and re-bucketing an
+/// already-bucketed price can differ at a digit boundary (e.g. ask 99999.5).
 pub(super) fn compute_coin_l2_snapshots<O: InnerOrder>(order_book: &OrderBook<O>) -> CoinL2Snapshots {
+    let max = Some(MAX_LEVELS);
+    let params = |n_sig_figs, mantissa| L2SnapshotParams { n_sig_figs, mantissa };
+    // Feeding the book's price levels into the bucketer equals bucketing the full-depth L2 snapshot.
+    let sf5 = order_book.to_l2_snapshot(None, Some(5), None);
+    // Some(2) is NOT a superset of this info!
+    let sf5_m5 = sf5.to_l2_snapshot(None, Some(5), Some(5));
+    let sf4 = sf5_m5.to_l2_snapshot(None, Some(4), None);
+    let sf3 = sf4.to_l2_snapshot(None, Some(3), None);
+    HashMap::from([
+        (params(None, None), order_book.to_l2_snapshot(max, None, None)),
+        (params(Some(5), Some(2)), sf5.to_l2_snapshot(max, Some(5), Some(2))),
+        (params(Some(2), None), sf3.to_l2_snapshot(max, Some(2), None)),
+        (params(Some(5), None), sf5.truncate(MAX_LEVELS)),
+        (params(Some(5), Some(5)), sf5_m5.truncate(MAX_LEVELS)),
+        (params(Some(4), None), sf4.truncate(MAX_LEVELS)),
+        (params(Some(3), None), sf3.truncate(MAX_LEVELS)),
+    ])
+}
+
+/// The pre-2026-09-28 `compute_coin_l2_snapshots`: every variant at full depth.
+#[cfg(test)]
+pub(crate) fn compute_coin_l2_snapshots_full_depth<O: InnerOrder>(order_book: &OrderBook<O>) -> CoinL2Snapshots {
     let mut entries = Vec::new();
     let snapshot = order_book.to_l2_snapshot(None, None, None);
     entries.push((L2SnapshotParams { n_sig_figs: None, mantissa: None }, snapshot));
@@ -195,7 +222,6 @@ pub(super) fn compute_coin_l2_snapshots<O: InnerOrder>(order_book: &OrderBook<O>
         if n_sig_figs == 5 {
             for mantissa in [None, Some(2), Some(5)] {
                 if mantissa == Some(5) {
-                    // Some(2) is NOT a superset of this info!
                     add_new_snapshot(Some(n_sig_figs), mantissa, 2);
                 } else {
                     add_new_snapshot(Some(n_sig_figs), mantissa, 1);

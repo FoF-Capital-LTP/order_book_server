@@ -89,12 +89,10 @@ impl<K: Clone + Eq + Hash, T: Clone> LinkedList<K, T> {
         }
     }
 
-    pub(crate) fn remove_node(&mut self, key: K) -> bool {
+    pub(crate) fn remove_node(&mut self, key: K) -> Option<T> {
         if let Some((_, sid)) = self.key_to_sid.remove_entry(&key) {
-            let (prev, next) = {
-                let order = self.slab.remove(sid);
-                (order.prev, order.next)
-            };
+            let order = self.slab.remove(sid);
+            let (prev, next) = (order.prev, order.next);
             if let Some(p) = prev {
                 let prev_order = &mut self.slab[p];
                 prev_order.next = next;
@@ -107,10 +105,15 @@ impl<K: Clone + Eq + Hash, T: Clone> LinkedList<K, T> {
             } else {
                 self.tail = prev;
             }
-            true
+            Some(order.value)
         } else {
-            false
+            None
         }
+    }
+
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.key_to_sid.len()
     }
 
     pub(crate) fn node_value_mut(&mut self, key: &K) -> Option<&mut T> {

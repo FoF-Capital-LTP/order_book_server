@@ -13,7 +13,7 @@ use crate::{
 use log::warn;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
@@ -165,8 +165,8 @@ impl OrderBookState {
 
     pub(super) fn apply_updates(
         &mut self,
-        order_statuses: Batch<NodeDataOrderStatus>,
-        order_diffs: Batch<NodeDataOrderDiff>,
+        order_statuses: &Batch<NodeDataOrderStatus>,
+        order_diffs: &Batch<NodeDataOrderDiff>,
     ) -> Result<()> {
         let height = order_statuses.block_number();
         let time = order_statuses.block_time();
@@ -211,10 +211,9 @@ impl OrderBookState {
         // A sequential block arrived — clear the initial-gap grace period.
         // From now on, any forward gap is a real data integrity issue.
         self.allow_initial_gap = false;
-        let mut diffs = order_diffs.events().into_iter().collect::<VecDeque<_>>();
         let mut order_map = order_statuses
-            .events()
-            .into_iter()
+            .events_ref()
+            .iter()
             .filter_map(|order_status| {
                 if order_status.is_inserted_into_book() {
                     Some((Oid::new(order_status.order.oid), order_status))
@@ -223,7 +222,7 @@ impl OrderBookState {
                 }
             })
             .collect::<HashMap<_, _>>();
-        while let Some(diff) = diffs.pop_front() {
+        for diff in order_diffs.events_ref() {
             let oid = diff.oid();
             let coin = diff.coin();
             if coin.is_spot() && self.ignore_spot {
@@ -234,7 +233,7 @@ impl OrderBookState {
                 InnerOrderDiff::New { sz } => {
                     if let Some(order) = order_map.remove(&oid) {
                         let time = order.time.and_utc().timestamp_millis();
-                        let mut inner_order: InnerL4Order = order.try_into()?;
+                        let mut inner_order: InnerL4Order = order.clone().try_into()?;
                         inner_order.modify_sz(sz);
                         // must replace time with time of entering book, which is the timestamp of the order status update
                         #[allow(clippy::unwrap_used)]
@@ -297,9 +296,9 @@ impl OrderBookState {
 mod real_snapshot_test {
     use super::*;
     use crate::{
-        listeners::order_book::utils::compute_l2_snapshots,
+        listeners::order_book::utils::{compute_coin_l2_snapshots_full_depth, compute_l2_snapshots},
         order_book::multi_book::load_snapshots_from_str,
-        types::{L4Order, inner::InnerLevel},
+        types::{L4Order, inner::InnerLevel, subscription::MAX_LEVELS},
     };
     use alloy::primitives::Address;
     use std::time::{Duration, Instant};
@@ -336,7 +335,7 @@ mod real_snapshot_test {
             let statuses: Batch<NodeDataOrderStatus> = serde_json::from_str(statuses).unwrap();
             let diffs: Batch<NodeDataOrderDiff> = serde_json::from_str(diffs).unwrap();
             assert_eq!(statuses.block_number(), state.height + 1);
-            state.apply_updates(statuses, diffs).unwrap();
+            state.apply_updates(&statuses, &diffs).unwrap();
             n_blocks += 1;
             if n_blocks == 200 {
                 // A newly-listed coin grafted mid-stream, and an existing book replaced.
@@ -367,6 +366,23 @@ mod real_snapshot_test {
                 }
             }
             prev = incremental.clone();
+
+            for book in state.order_book.as_ref().values() {
+                book.assert_level_sizes();
+            }
+            if n_blocks % 10 == 1 {
+                // Every variant equals the old full-depth chain cut to what clients can request.
+                for (coin, book) in state.order_book.as_ref() {
+                    let got = &incremental[coin];
+                    let expected = compute_coin_l2_snapshots_full_depth(book);
+                    assert_eq!(got.len(), expected.len(), "{coin:?}");
+                    for (params, expected) in &expected {
+                        let (got, expected) = (&got[params], expected.truncate(MAX_LEVELS));
+                        assert!(got.as_ref().iter().all(|side| side.len() <= MAX_LEVELS));
+                        assert!(same_l2(got, &expected), "block {} {coin:?} {params:?} differs", state.height);
+                    }
+                }
+            }
         }
         assert_eq!(n_blocks, 400, "fixture should hold 400 blocks");
         eprintln!(
