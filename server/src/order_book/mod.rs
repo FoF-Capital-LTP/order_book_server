@@ -234,7 +234,7 @@ fn match_order<O: InnerOrder>(maker_orders: &mut BTreeMap<Px, PriceLevel<O>>, ta
 
 #[cfg(test)]
 mod tests {
-    use crate::order_book::types::{Coin, Sz};
+    use crate::order_book::types::Sz;
 
     use super::*;
     use std::collections::BTreeSet;
@@ -280,10 +280,6 @@ mod tests {
         }
 
         fn convert_trigger(&mut self, _: u64) {}
-
-        fn coin(&self) -> Coin {
-            Coin::new("")
-        }
     }
 
     impl MinimalOrder {

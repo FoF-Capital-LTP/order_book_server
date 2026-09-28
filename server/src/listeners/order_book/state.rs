@@ -4,7 +4,7 @@ use crate::{
         utils::{compute_coin_l2_snapshots, compute_coin_raw_l2_snapshot},
     },
     order_book::{
-        Coin, InnerOrder, Oid, Px, Snapshot,
+        Coin, InnerOrder, Oid, OrderBook, Px, Snapshot,
         multi_book::{OrderBooks, Snapshots},
     },
     prelude::*,
@@ -254,85 +254,47 @@ impl OrderBookState {
         // A sequential block arrived — clear the initial-gap grace period.
         // From now on, any forward gap is a real data integrity issue.
         self.allow_initial_gap = false;
-        let mut order_map = order_statuses
-            .events_ref()
-            .iter()
-            .filter_map(|order_status| {
-                if order_status.is_inserted_into_book() {
-                    Some((Oid::new(order_status.order.oid), order_status))
-                } else {
-                    None
-                }
-            })
-            .collect::<HashMap<_, _>>();
+        // Books are independent, so each coin's diffs (in block order) are applied in
+        // parallel; serially this was 3.8 ms p50 / 18 ms p99 under the listener mutex
+        // (2026-09-28), spread over ~140 coins per block.
+        let mut work: HashMap<&str, CoinUpdates<'_>> = HashMap::new();
         for diff in order_diffs.events_ref() {
-            let oid = diff.oid();
-            let coin = diff.coin();
-            if coin.is_spot() && self.ignore_spot {
+            let coin = diff.coin_str();
+            if self.ignore_spot && diff.coin().is_spot() {
                 continue;
             }
-            let inner_diff = diff.diff().try_into()?;
-            match inner_diff {
-                InnerOrderDiff::New { sz, insert_before } => {
-                    if let Some(order) = order_map.remove(&oid) {
-                        let time = order.time.and_utc().timestamp_millis();
-                        let mut inner_order: InnerL4Order = order.clone().try_into()?;
-                        inner_order.modify_sz(sz);
-                        // must replace time with time of entering book, which is the timestamp of the order status update
-                        #[allow(clippy::unwrap_used)]
-                        inner_order.convert_trigger(time.try_into().unwrap());
-                        // For stop market/limit triggers, status.order.limitPx is the trigger
-                        // condition price, not the resting price on the book. The actual price
-                        // the order rests at is on the diff event itself. For ordinary limit
-                        // orders the two are equal, so this is a no-op there.
-                        inner_order.limit_px = Px::parse_from_str(diff.px())?;
-                        // A missing insertBefore anchor only misplaces the order within its
-                        // level (sizes and L2 stay right), so warn rather than fail the listener.
-                        if !self.order_book.add_order_before(inner_order, insert_before) {
-                            let misses = INSERT_BEFORE_MISSES.fetch_add(1, Ordering::Relaxed) + 1;
-                            if misses.is_power_of_two() {
-                                warn!("insertBefore anchor not on the book, rested at the back of its level ({misses} so far) {diff:?}");
-                            }
-                        }
-                    } else {
-                        return Err(format!("Unable to find order opening status {diff:?}").into());
-                    }
+            work.entry(coin).or_default().diffs.push(diff);
+        }
+        for status in order_statuses.events_ref() {
+            if status.is_inserted_into_book() {
+                if let Some(updates) = work.get_mut(status.order.coin.as_str()) {
+                    updates.opening_statuses.insert(Oid::new(status.order.oid), status);
                 }
-                InnerOrderDiff::Update { new_sz, .. } => {
-                    // If the book is not tracked yet, this is a newly-listed
-                    // coin whose snapshot has not been grafted via
-                    // absorb_extra_books. Skip — the next fetch_snapshot will
-                    // absorb it and bring local state into sync. Hard-erroring
-                    // here would crash the listener for a benign add.
-                    if !self.order_book.has_book(&coin) {
-                        if self.should_warn_not_yet_grafted(&coin, height) {
-                            warn!(
-                                "Skipping Update for not-yet-grafted coin {} oid {:?} at block {height}; waiting for absorb_extra_books",
-                                coin.value(),
-                                oid
-                            );
-                        }
-                        continue;
-                    }
-                    if !self.order_book.modify_sz(oid, coin, new_sz) {
-                        return Err(format!("Unable to find order on the book {diff:?}").into());
-                    }
+            }
+        }
+        let (results, untracked) = self.order_book.par_update_books(work, |book, updates| {
+            apply_coin_updates(&mut CoinBook::Tracked(book), updates).map(|skipped| debug_assert!(skipped.is_none()))
+        });
+        results.into_iter().collect::<Result<()>>()?;
+        // Coins without a book yet: a newly-listed coin gets one from its first New diff.
+        for (coin, updates) in untracked {
+            let coin = Coin::new(coin);
+            let mut book = CoinBook::Untracked(None);
+            let skipped = apply_coin_updates(&mut book, updates)?;
+            if let Some((op, oid)) = skipped {
+                // If the book is not tracked yet, this is a newly-listed coin whose
+                // snapshot has not been grafted via absorb_extra_books. Skip — the
+                // next fetch_snapshot will absorb it and bring local state into sync.
+                // Hard-erroring here would crash the listener for a benign add.
+                if self.should_warn_not_yet_grafted(&coin, height) {
+                    warn!(
+                        "Skipping {op} for not-yet-grafted coin {} oid {oid:?} at block {height}; waiting for absorb_extra_books",
+                        coin.value(),
+                    );
                 }
-                InnerOrderDiff::Remove => {
-                    if !self.order_book.has_book(&coin) {
-                        if self.should_warn_not_yet_grafted(&coin, height) {
-                            warn!(
-                                "Skipping Remove for not-yet-grafted coin {} oid {:?} at block {height}; waiting for absorb_extra_books",
-                                coin.value(),
-                                oid
-                            );
-                        }
-                        continue;
-                    }
-                    if !self.order_book.cancel_order(oid, coin) {
-                        return Err(format!("Unable to find order on the book {diff:?}").into());
-                    }
-                }
+            }
+            if let CoinBook::Untracked(Some(book)) = book {
+                self.order_book.add_book(coin, *book);
             }
         }
         self.height += 1;
@@ -340,6 +302,92 @@ impl OrderBookState {
         self.snapped = false;
         Ok(())
     }
+}
+
+/// One coin's share of a block: its diffs in block order, and the statuses of
+/// orders that rest on the book (by oid) for its New diffs.
+#[derive(Default)]
+struct CoinUpdates<'a> {
+    diffs: Vec<&'a NodeDataOrderDiff>,
+    opening_statuses: HashMap<Oid, &'a NodeDataOrderStatus>,
+}
+
+enum CoinBook<'b> {
+    Tracked(&'b mut OrderBook<InnerL4Order>),
+    /// Not tracked yet; Some once a New diff created the book.
+    Untracked(Option<Box<OrderBook<InnerL4Order>>>),
+}
+
+impl CoinBook<'_> {
+    fn get(&mut self) -> Option<&mut OrderBook<InnerL4Order>> {
+        match self {
+            CoinBook::Tracked(book) => Some(book),
+            CoinBook::Untracked(book) => book.as_deref_mut(),
+        }
+    }
+
+    fn get_or_create(&mut self) -> &mut OrderBook<InnerL4Order> {
+        match self {
+            CoinBook::Tracked(book) => book,
+            CoinBook::Untracked(book) => book.get_or_insert_with(|| Box::new(OrderBook::new())),
+        }
+    }
+}
+
+/// Applies one coin's diffs. Returns the first Update/Remove skipped because the coin
+/// has no book yet (only possible for `CoinBook::Untracked`).
+fn apply_coin_updates(book: &mut CoinBook<'_>, updates: CoinUpdates<'_>) -> Result<Option<(&'static str, Oid)>> {
+    let CoinUpdates { diffs, mut opening_statuses } = updates;
+    let mut skipped = None;
+    for diff in diffs {
+        let oid = diff.oid();
+        let inner_diff = diff.diff().try_into()?;
+        match inner_diff {
+            InnerOrderDiff::New { sz, insert_before } => {
+                let Some(order) = opening_statuses.remove(&oid) else {
+                    return Err(format!("Unable to find order opening status {diff:?}").into());
+                };
+                let time = order.time.and_utc().timestamp_millis();
+                let mut inner_order: InnerL4Order = order.clone().try_into()?;
+                inner_order.modify_sz(sz);
+                // must replace time with time of entering book, which is the timestamp of the order status update
+                #[allow(clippy::unwrap_used)]
+                inner_order.convert_trigger(time.try_into().unwrap());
+                // For stop market/limit triggers, status.order.limitPx is the trigger
+                // condition price, not the resting price on the book. The actual price
+                // the order rests at is on the diff event itself. For ordinary limit
+                // orders the two are equal, so this is a no-op there.
+                inner_order.limit_px = Px::parse_from_str(diff.px())?;
+                // A missing insertBefore anchor only misplaces the order within its
+                // level (sizes and L2 stay right), so warn rather than fail the listener.
+                if !book.get_or_create().add_order_before(inner_order, insert_before) {
+                    let misses = INSERT_BEFORE_MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+                    if misses.is_power_of_two() {
+                        warn!("insertBefore anchor not on the book, rested at the back of its level ({misses} so far) {diff:?}");
+                    }
+                }
+            }
+            InnerOrderDiff::Update { new_sz, .. } => {
+                let Some(book) = book.get() else {
+                    skipped = skipped.or(Some(("Update", oid)));
+                    continue;
+                };
+                if !book.modify_sz(oid, new_sz) {
+                    return Err(format!("Unable to find order on the book {diff:?}").into());
+                }
+            }
+            InnerOrderDiff::Remove => {
+                let Some(book) = book.get() else {
+                    skipped = skipped.or(Some(("Remove", oid)));
+                    continue;
+                };
+                if !book.cancel_order(oid) {
+                    return Err(format!("Unable to find order on the book {diff:?}").into());
+                }
+            }
+        }
+    }
+    Ok(skipped)
 }
 
 #[cfg(test)]
@@ -386,12 +434,15 @@ mod real_snapshot_test {
         let n_coins = prev.len();
         let (mut n_blocks, mut n_recomputed, mut incr_time, mut full_time) = (0, 0, Duration::ZERO, Duration::ZERO);
         let (mut n_insert_before, mut n_ahead_checked, mut n_aggregated_entries) = (0, 0, 0);
+        let mut apply_time = Duration::ZERO;
         let mut lines = blocks.lines();
         while let (Some(statuses), Some(diffs)) = (lines.next(), lines.next()) {
             let statuses: Batch<NodeDataOrderStatus> = serde_json::from_str(statuses).unwrap();
             let diffs: Batch<NodeDataOrderDiff> = serde_json::from_str(diffs).unwrap();
             assert_eq!(statuses.block_number(), state.height + 1);
+            let start = Instant::now();
             state.apply_updates(&statuses, &diffs).unwrap();
+            apply_time += start.elapsed();
             n_blocks += 1;
 
             // An insertBefore order must queue ahead of its anchor while both still rest.
@@ -472,12 +523,74 @@ mod real_snapshot_test {
         assert!(n_ahead_checked > 0);
         eprintln!("{n_insert_before} insertBefore diffs, {n_ahead_checked} checked queued ahead of their anchor");
         eprintln!(
-            "{n_blocks} blocks, {n_coins} coins: {:.1} coins recomputed, {:.1} with sig-fig variants per block; l2 incremental {:?}/block vs full {:?}/block",
+            "{n_blocks} blocks, {n_coins} coins: {:.1} coins recomputed, {:.1} with sig-fig variants per block; apply {:?}/block; l2 incremental {:?}/block vs full {:?}/block",
             n_recomputed as f64 / f64::from(n_blocks),
             n_aggregated_entries as f64 / f64::from(n_blocks),
+            apply_time / n_blocks,
             incr_time / n_blocks,
             full_time / n_blocks,
         );
+    }
+
+    /// A coin without a book (newly listed, not grafted yet) gets one from its first New
+    /// diff; Update/Remove before that are skipped. Other coins apply as usual.
+    #[test]
+    fn untracked_coin_gets_a_book_from_its_first_new_diff() {
+        let (Ok(json), Ok(blocks)) = (fs::read_to_string(FIXTURE), fs::read_to_string(REPLAY_BLOCKS)) else {
+            eprintln!("skipping: {FIXTURE} or {REPLAY_BLOCKS} not present");
+            return;
+        };
+        let load = || load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json).unwrap();
+        let (height, snapshot) = load();
+        let mut lines = blocks.lines();
+        let statuses: Batch<NodeDataOrderStatus> = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let diffs: Batch<NodeDataOrderDiff> = serde_json::from_str(lines.next().unwrap()).unwrap();
+
+        // What the untracked path must do with one coin's diffs: None if it would error
+        // (or miss an insertBefore anchor), else the resting oids and whether any were skipped.
+        let simulate = |coin: &str| {
+            let (mut live, mut tracked, mut skipped) = (HashMap::new(), false, false);
+            for diff in diffs.events_ref().iter().filter(|d| d.coin_str() == coin) {
+                match diff.diff() {
+                    OrderDiff::New { insert_before, .. } => {
+                        if insert_before.is_some_and(|a| live.get(&Oid::new(a)) != Some(&diff.px())) {
+                            return None;
+                        }
+                        tracked = true;
+                        live.insert(diff.oid(), diff.px());
+                    }
+                    _ if !tracked => skipped = true,
+                    OrderDiff::Remove => live.remove(&diff.oid()).map(|_| ())?,
+                    OrderDiff::Update { .. } => live.contains_key(&diff.oid()).then_some(())?,
+                }
+            }
+            tracked.then(|| (live.into_keys().collect::<HashSet<_>>(), skipped))
+        };
+        let coins: HashSet<&str> = diffs.events_ref().iter().map(NodeDataOrderDiff::coin_str).collect();
+        let mut candidates: Vec<_> = coins.into_iter().filter_map(|c| simulate(c).map(|r| (c, r))).collect();
+        // Prefer a coin that exercises the skip, then the most resting orders.
+        candidates.sort_by_key(|(c, (live, skipped))| (!skipped, std::cmp::Reverse(live.len()), c.to_string()));
+        let (coin, (expected_live, skipped)) = candidates.into_iter().next().expect("some coin can start untracked");
+        let coin = Coin::new(coin);
+
+        let mut reference = OrderBookState::from_snapshot(load().1, height, 0, true, true);
+        let mut books = snapshot.value();
+        assert!(books.remove(&coin).is_some());
+        let mut state = OrderBookState::from_snapshot(Snapshots::new(books), height, 0, true, true);
+        reference.apply_updates(&statuses, &diffs).unwrap();
+        state.apply_updates(&statuses, &diffs).unwrap();
+
+        let (_, _, book) = state.compute_coin_snapshot(&coin).expect("book created from the first New diff");
+        let got: HashSet<_> = book.as_ref().iter().flatten().map(InnerOrder::oid).collect();
+        assert_eq!(got, expected_live, "{coin:?}");
+        assert_eq!(state.not_yet_grafted_last_warn.contains_key(&coin), skipped);
+        assert!(state.order_book.take_changed().contains(&coin));
+        let (expected, got) = (reference.compute_snapshot(), state.compute_snapshot());
+        assert_eq!(got.as_ref().len(), expected.as_ref().len());
+        for (c, expected) in expected.as_ref().iter().filter(|(c, _)| **c != coin) {
+            assert_eq!(got.as_ref()[c].as_ref(), expected.as_ref(), "{c:?}");
+        }
+        eprintln!("untracked {coin:?}: {} resting, skipped={skipped}", expected_live.len());
     }
 
     /// Validation reports queue-order differences, so a book built from a node snapshot must

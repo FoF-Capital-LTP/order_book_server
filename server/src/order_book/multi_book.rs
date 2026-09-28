@@ -1,8 +1,8 @@
 use crate::{
-    order_book::{Coin, InnerOrder, Oid, OrderBook, Snapshot, Sz},
+    order_book::{Coin, InnerOrder, OrderBook, Snapshot},
     prelude::*,
 };
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -62,13 +62,6 @@ impl<O: InnerOrder> OrderBooks<O> {
         std::mem::take(&mut self.changed)
     }
 
-    // Returns false when `insert_before` cannot be honored; see OrderBook::add_order_before.
-    pub(crate) fn add_order_before(&mut self, order: O, insert_before: Option<Oid>) -> bool {
-        let coin = &order.coin();
-        self.mark_changed(coin);
-        self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).add_order_before(order, insert_before)
-    }
-
     /// Graft a fetched snapshot for a new coin into this multi-book.
     /// Used to absorb coins that appeared in the authoritative snapshot but
     /// were not yet tracked locally (e.g. newly-listed assets), avoiding a
@@ -79,23 +72,10 @@ impl<O: InnerOrder> OrderBooks<O> {
         self.order_books.insert(coin, OrderBook::from_snapshot(snapshot, ignore_triggers));
     }
 
-    pub(crate) fn cancel_order(&mut self, oid: Oid, coin: Coin) -> bool {
+    /// Starts tracking `coin` with `book`, which the caller built up from its diffs.
+    pub(crate) fn add_book(&mut self, coin: Coin, book: OrderBook<O>) {
         self.mark_changed(&coin);
-        self.order_books.get_mut(&coin).is_some_and(|book| book.cancel_order(oid))
-    }
-
-    /// Returns true if a book is currently tracked for `coin`. Used to detect
-    /// diffs that arrived for a not-yet-grafted (newly-listed) asset so the
-    /// listener can skip them gracefully and let absorb_extra_books catch up
-    /// on the next snapshot fetch instead of dying with a fatal.
-    pub(crate) fn has_book(&self, coin: &Coin) -> bool {
-        self.order_books.contains_key(coin)
-    }
-
-    // change size to reflect how much gets matched during the block
-    pub(crate) fn modify_sz(&mut self, oid: Oid, coin: Coin, sz: Sz) -> bool {
-        self.mark_changed(&coin);
-        self.order_books.get_mut(&coin).is_some_and(|book| book.modify_sz(oid, sz))
+        self.order_books.insert(coin, book);
     }
 }
 
@@ -104,6 +84,29 @@ impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
     pub(crate) fn to_snapshots_par(&self) -> Snapshots<O> {
         let snapshots = self.order_books.par_iter().map(|(c, book)| (c.clone(), book.to_snapshot())).collect();
         Snapshots(snapshots)
+    }
+
+    /// Runs `update` on the book of each coin in `work`, in parallel, and marks those
+    /// coins changed. Returns the results, and the work for coins without a book.
+    pub(crate) fn par_update_books<'w, W: Send, R: Send>(
+        &mut self,
+        mut work: HashMap<&'w str, W>,
+        update: impl Fn(&mut OrderBook<O>, W) -> R + Sync,
+    ) -> (Vec<R>, HashMap<&'w str, W>) {
+        let mut jobs = Vec::with_capacity(work.len());
+        for (coin, book) in &mut self.order_books {
+            if work.is_empty() {
+                break;
+            }
+            if let Some(w) = work.remove(coin.as_str()) {
+                if !self.changed.contains(coin) {
+                    self.changed.insert(coin.clone());
+                }
+                jobs.push((book, w));
+            }
+        }
+        let results = jobs.into_par_iter().map(|(book, w)| update(book, w)).collect();
+        (results, work)
     }
 
     /// Same result as `clone()`, with the per-coin books cloned in parallel.

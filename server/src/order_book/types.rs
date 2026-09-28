@@ -57,7 +57,6 @@ impl Oid {
 }
 
 pub(crate) trait InnerOrder: Clone {
-    fn coin(&self) -> Coin;
     fn oid(&self) -> Oid;
     fn side(&self) -> Side;
     fn limit_px(&self) -> Px;
@@ -75,6 +74,10 @@ impl Coin {
 
     pub(crate) fn value(&self) -> String {
         self.0.clone()
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 
     pub(crate) fn is_spot(&self) -> bool {

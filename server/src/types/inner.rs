@@ -71,10 +71,6 @@ impl InnerOrder for InnerL4Order {
             self.tif = Some("Gtc".to_string());
         }
     }
-
-    fn coin(&self) -> Coin {
-        self.coin.clone()
-    }
 }
 
 impl TryFrom<(Address, L4Order)> for InnerL4Order {
