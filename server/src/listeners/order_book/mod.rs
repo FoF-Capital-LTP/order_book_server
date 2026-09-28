@@ -452,6 +452,8 @@ pub(crate) struct OrderBookListener {
     /// hl-node local_time (µs) of the last applied block; stamped on L2
     /// snapshot messages so client tasks can measure delivery latency.
     last_applied_local_time_us: u64,
+    /// Of the last L2 snapshot message: tells the next one which frames clients want.
+    last_snapshot_shared: Option<Arc<SnapshotShared>>,
 }
 
 /// Plan E: tracks "stuck on the same byte offset" state for a single
@@ -504,6 +506,7 @@ impl OrderBookListener {
             parse_fail_order_statuses: ParseFailureTracker::default(),
             parse_fail_order_diffs: ParseFailureTracker::default(),
             last_applied_local_time_us: 0,
+            last_snapshot_shared: None,
         }
     }
 
@@ -714,6 +717,16 @@ impl OrderBookListener {
         self.order_book_state.as_ref().and_then(|o| o.compute_coin_snapshot(coin))
     }
 
+    /// Broadcasts the L2 snapshot of the current height unless already sent.
+    fn broadcast_l2_snapshot(&mut self) {
+        let Some((time, l2_snapshots)) = self.l2_snapshots(true) else { return };
+        let Some(tx) = &self.internal_message_tx else { return };
+        let shared = Arc::new(SnapshotShared::following(self.last_snapshot_shared.as_deref()));
+        self.last_snapshot_shared = Some(shared.clone());
+        let local_time_us = self.last_applied_local_time_us;
+        let _unused = tx.send(Arc::new(InternalMessage::Snapshot { l2_snapshots, time, local_time_us, shared }));
+    }
+
     // prevent snapshotting mutiple times at the same height
     fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
         self.order_book_state.as_mut().and_then(|o| o.l2_snapshots(prevent_future_snaps))
@@ -917,17 +930,7 @@ impl DirectoryListener for OrderBookListener {
                 return Err(err);
             }
         }
-        let snapshot = self.l2_snapshots(true);
-        if let Some(snapshot) = snapshot {
-            if let Some(tx) = &self.internal_message_tx {
-                let _unused = tx.send(Arc::new(InternalMessage::Snapshot {
-                    l2_snapshots: snapshot.1,
-                    time: snapshot.0,
-                    local_time_us: self.last_applied_local_time_us,
-                    shared: SnapshotShared::default(),
-                }));
-            }
-        }
+        self.broadcast_l2_snapshot();
         Ok(())
     }
 }
@@ -1026,17 +1029,7 @@ impl OrderBookListener {
         info!(
             "[hour-rollover-diag] stream_lines ok exit: source={event_source} lines_drained={lines_drained} first_height_seen={first_height_seen:?} last_height_seen={last_height_seen:?} state.height={height_at_exit:?}"
         );
-        let snapshot = self.l2_snapshots(true);
-        if let Some(snapshot) = snapshot {
-            if let Some(tx) = &self.internal_message_tx {
-                let _unused = tx.send(Arc::new(InternalMessage::Snapshot {
-                    l2_snapshots: snapshot.1,
-                    time: snapshot.0,
-                    local_time_us: self.last_applied_local_time_us,
-                    shared: SnapshotShared::default(),
-                }));
-            }
-        }
+        self.broadcast_l2_snapshot();
         Ok(())
     }
 }
@@ -1056,7 +1049,7 @@ impl L2Snapshots {
 // Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
     /// `local_time_us`: hl-node write time of the block this snapshot reflects.
-    Snapshot { l2_snapshots: L2Snapshots, time: u64, local_time_us: u64, shared: SnapshotShared },
+    Snapshot { l2_snapshots: L2Snapshots, time: u64, local_time_us: u64, shared: Arc<SnapshotShared> },
     Fills { batch: Batch<NodeDataFill> },
     L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
 }

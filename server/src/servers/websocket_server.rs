@@ -170,6 +170,9 @@ async fn handle_socket(
                                 })
                             },
                         };
+                        if let Err(err) = socket.flush().await {
+                            error!("Failed to send: {err}");
+                        }
                         latency::CLIENT_HANDLE_US.record_duration_us(handle_start.elapsed());
                         if let Some((histogram, local_time_us)) = delivered {
                             histogram.record_age_us(local_time_us);
@@ -310,15 +313,26 @@ fn serialize_message(msg: &ServerResponse) -> Option<FrameView> {
     }
 }
 
-async fn send_frame(socket: &mut WebSocket, frame: FrameView) {
-    if let Err(err) = socket.send(frame).await {
+async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
+    if let Some(frame) = serialize_message(&msg) {
+        if let Err(err) = socket.send(frame).await {
+            error!("Failed to send: {err}");
+        }
+    }
+}
+
+/// Queues `frame` without flushing. `handle_socket` flushes once per broadcast
+/// message: the codec writes whenever 8 KiB are buffered, instead of one
+/// syscall per frame (~67k sendto/s with per-frame flushes, 2026-09-28).
+async fn feed_frame(socket: &mut WebSocket, frame: FrameView) {
+    if let Err(err) = socket.feed(frame).await {
         error!("Failed to send: {err}");
     }
 }
 
-async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
+async fn feed_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
     if let Some(frame) = serialize_message(&msg) {
-        send_frame(socket, frame).await;
+        feed_frame(socket, frame).await;
     }
 }
 
@@ -336,27 +350,51 @@ type L2FrameKey = (String, Option<u32>, Option<u64>, usize);
 
 /// Work shared by all clients handling the same snapshot message: the
 /// universe and each distinct L2Book response are built once, not per client.
+///
+/// Keys some client requested for the previous snapshot are looked up without
+/// a lock; only keys new in this snapshot go through the mutex. One mutex for
+/// every lookup cost ~30% of obs CPU in futex contention (perf, 2026-09-28).
 #[derive(Default)]
 pub(crate) struct SnapshotShared {
     universe: OnceLock<Arc<HashSet<String>>>,
-    /// None: the coin or params are not in the snapshot.
-    l2_frames: std::sync::Mutex<HashMap<L2FrameKey, Option<FrameView>>>,
+    /// Keys requested for the previous snapshot. None: the coin or params are not in the snapshot.
+    known: HashMap<Arc<L2FrameKey>, OnceLock<Option<FrameView>>>,
+    /// Keys first requested for this snapshot.
+    new: std::sync::Mutex<HashMap<Arc<L2FrameKey>, Option<FrameView>>>,
 }
 
 impl SnapshotShared {
+    /// Lock-free slots for every key some client requested from `prev`; keys
+    /// nobody asked for drop out.
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn following(prev: Option<&Self>) -> Self {
+        let Some(prev) = prev else { return Self::default() };
+        let mut known: HashMap<_, _> = prev
+            .known
+            .iter()
+            .filter(|(_, frame)| frame.get().is_some())
+            .map(|(key, _)| (key.clone(), OnceLock::new()))
+            .collect();
+        known.extend(prev.new.lock().unwrap().keys().map(|key| (key.clone(), OnceLock::new())));
+        Self { universe: OnceLock::new(), known, new: std::sync::Mutex::default() }
+    }
+
     fn universe(&self, l2_snapshots: &L2Snapshots, ignore_spot: bool) -> Arc<HashSet<String>> {
         self.universe.get_or_init(|| Arc::new(new_universe(l2_snapshots, ignore_spot))).clone()
     }
 
-    /// The serialized L2Book response for `key`. Serialization runs outside the
-    /// lock; two clients racing on a new key both build the same bytes.
+    /// The serialized L2Book response for `key`. For a new key serialization
+    /// runs outside the lock; two clients racing on it both build the same bytes.
     #[allow(clippy::unwrap_used)]
     fn l2_frame(&self, key: L2FrameKey, build: impl FnOnce(&L2FrameKey) -> Option<FrameView>) -> Option<FrameView> {
-        if let Some(frame) = self.l2_frames.lock().unwrap().get(&key) {
+        if let Some(frame) = self.known.get(&key) {
+            return frame.get_or_init(|| build(&key)).clone();
+        }
+        if let Some(frame) = self.new.lock().unwrap().get(&key) {
             return frame.clone();
         }
         let frame = build(&key);
-        self.l2_frames.lock().unwrap().entry(key).or_insert(frame).clone()
+        self.new.lock().unwrap().entry(Arc::new(key)).or_insert(frame).clone()
     }
 }
 
@@ -385,7 +423,7 @@ async fn send_ws_data_from_snapshot(
             return;
         }
         if let Some(frame) = shared.l2_frame(key, |key| build_l2_frame(l2_snapshots, key, time)) {
-            send_frame(socket, frame).await;
+            feed_frame(socket, frame).await;
         }
     }
 }
@@ -518,7 +556,7 @@ async fn send_ws_data_from_book_updates(
     if let Subscription::L4Book { coin } = subscription {
         if let Some(updates) = book_updates.remove(coin) {
             let msg = ServerResponse::L4Book(L4Book::Updates(updates));
-            send_socket_message(socket, msg).await;
+            feed_socket_message(socket, msg).await;
         }
     }
 }
@@ -531,7 +569,7 @@ async fn send_ws_data_from_trades(
     if let Subscription::Trades { coin } = subscription {
         if let Some(trades) = trades.remove(coin) {
             let msg = ServerResponse::Trades(trades);
-            send_socket_message(socket, msg).await;
+            feed_socket_message(socket, msg).await;
         }
     }
 }
@@ -575,7 +613,7 @@ async fn send_ws_data_from_user_fills(
         if let Some(fills) = user_fills.remove(user) {
             // Streaming pushes omit `isSnapshot` per HL docs.
             let msg = ServerResponse::UserFills(WsUserFills { is_snapshot: None, user: *user, fills });
-            send_socket_message(socket, msg).await;
+            feed_socket_message(socket, msg).await;
         }
     }
 }
@@ -588,7 +626,7 @@ async fn send_ws_data_from_order_updates(
     if let Subscription::OrderUpdates { user } = subscription {
         if let Some(orders) = user_orders.remove(user) {
             let msg = ServerResponse::OrderUpdates(orders);
-            send_socket_message(socket, msg).await;
+            feed_socket_message(socket, msg).await;
         }
     }
 }
@@ -893,43 +931,84 @@ mod l2_frame_test {
             (Some(3), None),
             (Some(2), None),
         ];
-        let mut n_compared = 0;
         let mut coins: Vec<String> = l2_snapshots.as_ref().keys().map(|c| c.value()).collect();
         coins.push("NO_SUCH_COIN".to_string());
-        for coin in &coins {
-            for (n_sig_figs, mantissa) in params {
-                for n_levels in [None, Some(1), Some(5), Some(100)] {
-                    let sub = Subscription::L2Book { coin: coin.clone(), n_sig_figs, n_levels, mantissa };
-                    let old = old_l2_message(&l2_snapshots, &sub, time);
-                    let new = shared_l2_message(&shared, &l2_snapshots, &sub, time);
-                    assert_eq!(old.as_deref().map(str::as_bytes), new.as_ref().map(|f| &f.payload[..]), "{sub:?}");
-                    // A second client gets the cached frame: same bytes, no copy.
-                    let again = shared_l2_message(&shared, &l2_snapshots, &sub, time);
-                    assert_eq!(new.map(|f| f.payload.as_ptr()), again.map(|f| f.payload.as_ptr()), "{sub:?}");
-                    n_compared += usize::from(old.is_some());
-                }
+        let subs: Vec<Subscription> = coins
+            .iter()
+            .flat_map(|coin| {
+                params.into_iter().flat_map(move |(n_sig_figs, mantissa)| {
+                    [None, Some(1), Some(5), Some(100)].map(|n_levels| Subscription::L2Book {
+                        coin: coin.clone(),
+                        n_sig_figs,
+                        n_levels,
+                        mantissa,
+                    })
+                })
+            })
+            .collect();
+        let check = |shared: &SnapshotShared, time: u64| {
+            let mut n_compared = 0;
+            for sub in &subs {
+                let old = old_l2_message(&l2_snapshots, sub, time);
+                let new = shared_l2_message(shared, &l2_snapshots, sub, time);
+                assert_eq!(old.as_deref().map(str::as_bytes), new.as_ref().map(|f| &f.payload[..]), "{sub:?}");
+                // A second client gets the cached frame: same bytes, no copy.
+                let again = shared_l2_message(shared, &l2_snapshots, sub, time);
+                assert_eq!(new.map(|f| f.payload.as_ptr()), again.map(|f| f.payload.as_ptr()), "{sub:?}");
+                n_compared += usize::from(old.is_some());
             }
-        }
-        assert!(n_compared > 1000 * params.len() * 4, "{n_compared}");
+            assert!(n_compared > 1000 * params.len() * 4, "{n_compared}");
+        };
+        // First snapshot: every key is new (mutex path).
+        check(&shared, time);
+        assert!(shared.known.is_empty());
+        // Next snapshot: the same keys are served from the lock-free slots, with the new time.
+        let next = SnapshotShared::following(Some(&shared));
+        assert_eq!(next.known.len(), subs.len());
+        check(&next, time + 1);
+        assert!(next.new.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unrequested_keys_drop_out() {
+        let key = |coin: &str| -> L2FrameKey { (coin.to_string(), None, None, 20) };
+        let frame = |_: &L2FrameKey| Some(FrameView::text("x".to_string()));
+        let first = SnapshotShared::default();
+        first.l2_frame(key("BTC"), frame);
+        first.l2_frame(key("ETH"), frame);
+        let second = SnapshotShared::following(Some(&first));
+        second.l2_frame(key("BTC"), frame); // lock-free slot
+        second.l2_frame(key("SOL"), frame); // new this snapshot
+        let third = SnapshotShared::following(Some(&second));
+        let mut keys: Vec<_> = third.known.keys().map(|k| k.0.clone()).collect();
+        keys.sort();
+        assert_eq!(keys, ["BTC", "SOL"]);
+        assert!(SnapshotShared::following(None).known.is_empty());
     }
 
     #[test]
     fn concurrent_clients_get_identical_frames() {
-        let shared = SnapshotShared::default();
         let key: L2FrameKey = ("BTC".to_string(), None, None, 20);
-        let payloads: Vec<Vec<u8>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..8)
-                .map(|i| {
-                    let (shared, key) = (&shared, key.clone());
-                    scope.spawn(move || {
-                        let frame = shared.l2_frame(key, |_| Some(FrameView::text(format!("same bytes (built by {i})"))));
-                        frame.unwrap().payload.to_vec()
+        let first = SnapshotShared::default();
+        first.l2_frame(key.clone(), |_| Some(FrameView::text("previous".to_string())));
+        // Mutex path (new key) and lock-free path (key known from the previous snapshot).
+        for shared in [SnapshotShared::default(), SnapshotShared::following(Some(&first))] {
+            let payloads: Vec<Vec<u8>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|i| {
+                        let (shared, key) = (&shared, key.clone());
+                        scope.spawn(move || {
+                            let frame =
+                                shared.l2_frame(key, |_| Some(FrameView::text(format!("same bytes (built by {i})"))));
+                            frame.unwrap().payload.to_vec()
+                        })
                     })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        assert!(payloads.iter().all(|p| p == &payloads[0]));
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            assert!(payloads.iter().all(|p| p == &payloads[0]));
+            assert_ne!(payloads[0], b"previous");
+        }
     }
 
     #[test]
