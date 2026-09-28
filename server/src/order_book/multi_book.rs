@@ -140,11 +140,12 @@ where
 
 pub(crate) async fn load_snapshots_from_json<O, R>(path: &Path) -> Result<(u64, Snapshots<O>)>
 where
-    O: TryFrom<R, Error = Error>,
-    R: Serialize + for<'a> Deserialize<'a>,
+    O: TryFrom<R, Error = Error> + Send + 'static,
+    R: Serialize + for<'a> Deserialize<'a> + 'static,
 {
     let file_contents = read_to_string(path).await?;
-    load_snapshots_from_str(&file_contents)
+    // Parsing the full node snapshot (~370 MB) takes about a second; keep it off the async workers.
+    tokio::task::spawn_blocking(move || load_snapshots_from_str(&file_contents)).await?
 }
 
 #[cfg(test)]

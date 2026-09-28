@@ -652,10 +652,18 @@ impl Subscription {
         if let Self::L4Book { coin } = self {
             // Only this coin's book: snapshotting every coin here held the
             // listener mutex long enough to stall block processing.
+            // Deep books take tens of ms to copy and convert (BTC ~59k orders), so both steps
+            // run in block_in_place: otherwise the listener, woken into this worker's LIFO slot
+            // by the unlock, would wait for the conversion.
             let coin = Coin::new(coin);
-            let snapshot = listener.lock().await.compute_coin_snapshot(&coin);
+            let snapshot = {
+                let listener = listener.lock().await;
+                tokio::task::block_in_place(|| listener.compute_coin_snapshot(&coin))
+            };
             if let Some((time, height, snapshot)) = snapshot {
-                let snapshot = snapshot.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect());
+                let snapshot = tokio::task::block_in_place(|| {
+                    snapshot.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect())
+                });
                 return Ok(Some(ServerResponse::L4Book(L4Book::Snapshot {
                     coin: coin.value(),
                     time,

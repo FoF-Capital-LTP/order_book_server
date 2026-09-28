@@ -306,59 +306,31 @@ fn fetch_snapshot(
                 info!("Snapshot fetched");
                 // sleep to let some updates build up.
                 sleep(Duration::from_secs(1)).await;
-                let mut cache = {
+                let cache = {
                     let mut listener = listener.lock().await;
                     listener.take_cache()
                 };
                 info!("Cache has {} elements", cache.len());
                 match snapshot {
                     Ok((height, expected_snapshot)) => {
-                        if let Some(mut state) = state {
-                            let mut catch_up_failed = false;
-                            while state.height() < height {
-                                if let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                                    if let Err(err) = state.apply_updates(&order_statuses, &order_diffs) {
-                                        // Gap or other error during validation
-                                        // catch-up — the main loop already
-                                        // handled this (e.g. gap-grace-resync
-                                        // invalidated state). Abandon this
-                                        // validation pass; next tick will
-                                        // re-fetch cleanly.
-                                        warn!(
-                                            "[snapshot-catchup] apply_updates failed during validation catch-up (non-fatal): {err}"
-                                        );
-                                        catch_up_failed = true;
-                                        break;
-                                    }
-                                } else {
-                                    // Not enough cached updates to reach snapshot
-                                    // height. This is transient (snapshot is newer
-                                    // than our cache). Skip validation this round.
-                                    warn!(
-                                        "[snapshot-catchup] not enough cached updates (state.height={}, snapshot height={height}); skipping validation",
-                                        state.height()
-                                    );
-                                    catch_up_failed = true;
-                                    break;
-                                }
-                            }
-                            if catch_up_failed {
-                                return Ok::<(), Error>(());
-                            }
-                            if state.height() > height {
-                                // Fetched snapshot is older than local state. Skip
-                                // validation — next tick will fetch a fresher one.
-                                warn!(
-                                    "[snapshot-catchup] fetched snapshot height ({height}) lagging stored state ({}); skipping validation",
-                                    state.height()
-                                );
-                                return Ok::<(), Error>(());
-                            }
-                            let stored_snapshot = state.compute_snapshot();
-                            info!("Validating snapshot");
-                            match validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot) {
-                                Ok(extras) if extras.is_empty() => Ok(()),
-                                Ok(extras) => {
+                        if let Some(state) = state {
+                            // ~0.5 s of CPU on the full book. Run on an async worker, it
+                            // stalled the listener: take_cache's unlock can wake the waiting
+                            // listener into this worker's LIFO slot, which other workers
+                            // cannot steal, and it stayed there until this work finished.
+                            let start = Instant::now();
+                            let validation = tokio::task::spawn_blocking(move || {
+                                catch_up_and_validate(state, cache, height, expected_snapshot, ignore_spot)
+                            })
+                            .await;
+                            latency::SNAPSHOT_VALIDATE_US.record_duration_us(start.elapsed());
+                            // It only reads a copy of the state, so a panic in it is not fatal either.
+                            let validation = validation.unwrap_or_else(|err| {
+                                warn!("[snapshot-catchup] validation task failed (non-fatal): {err}");
+                                Validation::Skipped
+                            });
+                            if let Validation::Consistent(extras) = validation {
+                                if !extras.is_empty() {
                                     // Newly-listed (or previously-ignored) coins appeared in the
                                     // authoritative snapshot but not in our local state. Graft them
                                     // in so the listener does not have to restart.
@@ -373,22 +345,9 @@ fn fetch_snapshot(
                                     if let Some(state) = listener.order_book_state.as_mut() {
                                         state.absorb_extra_books(extras, true);
                                     }
-                                    Ok(())
-                                }
-                                Err(err) => {
-                                    // Validation mismatch is a timing race: between
-                                    // the snapshot fetch and the comparison, orders
-                                    // at the same price level get replaced by
-                                    // different orders. The local state (built from
-                                    // the authoritative diff stream) is correct;
-                                    // the fetched snapshot simply aged. Log and
-                                    // continue rather than crashing the process.
-                                    warn!(
-                                        "[snapshot-validation-race] mismatch during consistency check (non-fatal): {err}"
-                                    );
-                                    Ok(())
                                 }
                             }
+                            Ok(())
                         } else {
                             listener.lock().await.init_from_snapshot(expected_snapshot, height);
                             Ok(())
@@ -405,6 +364,76 @@ fn fetch_snapshot(
         let _unused = tx.send(res);
         Ok::<(), Error>(())
     });
+}
+
+#[derive(Debug)]
+enum Validation {
+    /// The cached updates could not bring the local state to the snapshot height.
+    Skipped,
+    /// Same orders on both sides; holds the books only the fetched snapshot has.
+    Consistent(HashMap<Coin, Snapshot<InnerL4Order>>),
+    Mismatch,
+}
+
+/// Brings `state` (cloned when the snapshot was requested) up to the fetched
+/// snapshot's height with the updates cached meanwhile, then compares the two.
+/// Synchronous and CPU-heavy; the caller runs it on the blocking pool, which
+/// also frees the large state and snapshots there.
+fn catch_up_and_validate(
+    mut state: OrderBookState,
+    mut cache: VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>,
+    height: u64,
+    expected_snapshot: Snapshots<InnerL4Order>,
+    ignore_spot: bool,
+) -> Validation {
+    while state.height() < height {
+        if let Some((order_statuses, order_diffs)) = cache.pop_front() {
+            if let Err(err) = state.apply_updates(&order_statuses, &order_diffs) {
+                // Gap or other error during validation
+                // catch-up — the main loop already
+                // handled this (e.g. gap-grace-resync
+                // invalidated state). Abandon this
+                // validation pass; next tick will
+                // re-fetch cleanly.
+                warn!("[snapshot-catchup] apply_updates failed during validation catch-up (non-fatal): {err}");
+                return Validation::Skipped;
+            }
+        } else {
+            // Not enough cached updates to reach snapshot
+            // height. This is transient (snapshot is newer
+            // than our cache). Skip validation this round.
+            warn!(
+                "[snapshot-catchup] not enough cached updates (state.height={}, snapshot height={height}); skipping validation",
+                state.height()
+            );
+            return Validation::Skipped;
+        }
+    }
+    if state.height() > height {
+        // Fetched snapshot is older than local state. Skip
+        // validation — next tick will fetch a fresher one.
+        warn!(
+            "[snapshot-catchup] fetched snapshot height ({height}) lagging stored state ({}); skipping validation",
+            state.height()
+        );
+        return Validation::Skipped;
+    }
+    let stored_snapshot = state.compute_snapshot();
+    info!("Validating snapshot");
+    match validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot) {
+        Ok(extras) => Validation::Consistent(extras),
+        Err(err) => {
+            // Validation mismatch is a timing race: between
+            // the snapshot fetch and the comparison, orders
+            // at the same price level get replaced by
+            // different orders. The local state (built from
+            // the authoritative diff stream) is correct;
+            // the fetched snapshot simply aged. Log and
+            // continue rather than crashing the process.
+            warn!("[snapshot-validation-race] mismatch during consistency check (non-fatal): {err}");
+            Validation::Mismatch
+        }
+    }
 }
 
 pub(crate) struct OrderBookListener {
@@ -1060,3 +1089,60 @@ pub(crate) struct L2SnapshotParams {
     mantissa: Option<u64>,
 }
 
+
+#[cfg(test)]
+mod validation_test {
+    use super::*;
+    use crate::order_book::multi_book::load_snapshots_from_str;
+
+    const FIXTURE: &str = "tmp/fixture/out.snap.json";
+    const REPLAY_BLOCKS: &str = "tmp/fixture/replay_blocks.jsonl";
+
+    #[test]
+    fn catch_up_and_validate_on_real_blocks() {
+        let (Ok(json), Ok(blocks)) = (fs::read_to_string(FIXTURE), fs::read_to_string(REPLAY_BLOCKS)) else {
+            eprintln!("skipping: {FIXTURE} or {REPLAY_BLOCKS} not present");
+            return;
+        };
+        let (height, snapshot) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json).unwrap();
+        drop(json);
+        let state = OrderBookState::from_snapshot(snapshot, height, 0, true, true);
+        let lines = blocks.lines().collect::<Vec<_>>();
+        let cache = |n: usize| {
+            lines
+                .chunks(2)
+                .take(n)
+                .map(|pair| (serde_json::from_str(pair[0]).unwrap(), serde_json::from_str(pair[1]).unwrap()))
+                .collect::<VecDeque<_>>()
+        };
+        let mut later = state.par_clone();
+        for (statuses, diffs) in cache(20) {
+            later.apply_updates(&statuses, &diffs).unwrap();
+        }
+        let target = height + 20;
+        assert_eq!(later.height(), target);
+
+        // Extra cached blocks past the snapshot height are left unapplied.
+        let validation = catch_up_and_validate(state.par_clone(), cache(30), target, later.compute_snapshot(), true);
+        assert!(matches!(&validation, Validation::Consistent(extras) if extras.is_empty()), "{validation:?}");
+
+        // A book only the fetched snapshot has is handed back for grafting.
+        let mut books = later.compute_snapshot().value();
+        books.insert(Coin::new("NEWCOIN"), books[&Coin::new("BTC")].clone());
+        let validation = catch_up_and_validate(state.par_clone(), cache(20), target, Snapshots::new(books), true);
+        assert!(
+            matches!(&validation, Validation::Consistent(extras) if extras.keys().eq([&Coin::new("NEWCOIN")])),
+            "{validation:?}"
+        );
+
+        // Too few cached blocks to reach the snapshot, or a snapshot older than the state.
+        let validation = catch_up_and_validate(state.par_clone(), cache(10), target, later.compute_snapshot(), true);
+        assert!(matches!(validation, Validation::Skipped), "{validation:?}");
+        let validation = catch_up_and_validate(later.par_clone(), cache(0), height, state.compute_snapshot(), true);
+        assert!(matches!(validation, Validation::Skipped), "{validation:?}");
+
+        // A snapshot that does not match the caught-up state.
+        let validation = catch_up_and_validate(state.par_clone(), cache(20), target, state.compute_snapshot(), true);
+        assert!(matches!(validation, Validation::Mismatch), "{validation:?}");
+    }
+}

@@ -105,6 +105,8 @@ pub(crate) static LOCK_WAIT_US: Histogram = Histogram::new("listener_lock_wait_u
 pub(crate) static LOCK_HOLD_US: Histogram = Histogram::new("listener_lock_hold_us");
 /// Snapshot-validation state clone, once per 60 s fetch (runs under the listener mutex).
 pub(crate) static SNAPSHOT_CLONE_US: Histogram = Histogram::new("snapshot_clone_us");
+/// Snapshot-validation catch-up and comparison, once per 60 s fetch (blocking pool, no mutex).
+pub(crate) static SNAPSHOT_VALIDATE_US: Histogram = Histogram::new("snapshot_validate_us");
 /// compute_l2_snapshots duration (runs under the listener mutex).
 pub(crate) static L2_COMPUTE_US: Histogram = Histogram::new("l2_compute_us");
 /// Wall clock minus hl-node local_time when a client with a matching
@@ -117,12 +119,13 @@ pub(crate) static CLIENT_HANDLE_US: Histogram = Histogram::new("client_handle_us
 /// Messages still queued for a client when it receives one; it is disconnected once this passes 100.
 pub(crate) static CLIENT_QUEUE_LEN: Histogram = Histogram::new("client_queue_len");
 
-static ALL: [&Histogram; 11] = [
+static ALL: [&Histogram; 12] = [
     &HL_WRITE_LAG_MS,
     &APPLY_AFTER_WRITE_US,
     &LOCK_WAIT_US,
     &LOCK_HOLD_US,
     &SNAPSHOT_CLONE_US,
+    &SNAPSHOT_VALIDATE_US,
     &L2_COMPUTE_US,
     &CLIENT_L2_AFTER_WRITE_US,
     &CLIENT_L4_AFTER_WRITE_US,
