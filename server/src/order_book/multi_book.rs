@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::Path,
+    sync::Arc,
 };
 use tokio::fs::read_to_string;
 
@@ -26,17 +27,28 @@ impl<O> Snapshots<O> {
     }
 }
 
+/// Books are shared copy-on-write like their price levels, so `clone()` is
+/// O(coins): the per-minute validation copy used to deep-clone ~550k orders in
+/// ~364k levels under the listener mutex (~40 ms even in parallel, 2026-09-29).
+/// A book is copied (its oid index and level map, not its orders) on its first
+/// write after a clone, in `par_update_books`'s parallel section.
 #[derive(Clone)]
 pub(crate) struct OrderBooks<O> {
-    order_books: BTreeMap<Coin, OrderBook<O>>,
+    order_books: BTreeMap<Coin, Arc<OrderBook<O>>>,
     /// Coins whose book may have changed since the last `take_changed`. Every
     /// mutating method below must record its coin here: the listener's
     /// incremental L2 cache only recomputes these.
     changed: HashSet<Coin>,
 }
 
+impl<O> Default for OrderBooks<O> {
+    fn default() -> Self {
+        Self { order_books: BTreeMap::new(), changed: HashSet::new() }
+    }
+}
+
 impl<O: InnerOrder> OrderBooks<O> {
-    pub(crate) const fn as_ref(&self) -> &BTreeMap<Coin, OrderBook<O>> {
+    pub(crate) const fn as_ref(&self) -> &BTreeMap<Coin, Arc<OrderBook<O>>> {
         &self.order_books
     }
     #[must_use]
@@ -45,7 +57,7 @@ impl<O: InnerOrder> OrderBooks<O> {
             order_books: snapshot
                 .value()
                 .into_iter()
-                .map(|(coin, book)| (coin, OrderBook::from_snapshot(book, ignore_triggers)))
+                .map(|(coin, book)| (coin, Arc::new(OrderBook::from_snapshot(book, ignore_triggers))))
                 .collect(),
             changed: HashSet::new(),
         }
@@ -69,13 +81,22 @@ impl<O: InnerOrder> OrderBooks<O> {
     /// already tracked.
     pub(crate) fn insert_book(&mut self, coin: Coin, snapshot: Snapshot<O>, ignore_triggers: bool) {
         self.mark_changed(&coin);
-        self.order_books.insert(coin, OrderBook::from_snapshot(snapshot, ignore_triggers));
+        self.order_books.insert(coin, Arc::new(OrderBook::from_snapshot(snapshot, ignore_triggers)));
     }
 
     /// Starts tracking `coin` with `book`, which the caller built up from its diffs.
     pub(crate) fn add_book(&mut self, coin: Coin, book: OrderBook<O>) {
         self.mark_changed(&coin);
-        self.order_books.insert(coin, book);
+        self.order_books.insert(coin, Arc::new(book));
+    }
+
+    /// Replaces (None: stops tracking) the book of `coin`.
+    pub(crate) fn replace_book(&mut self, coin: &Coin, book: Option<Arc<OrderBook<O>>>) {
+        self.mark_changed(coin);
+        match book {
+            Some(book) => self.order_books.insert(coin.clone(), book),
+            None => self.order_books.remove(coin),
+        };
     }
 }
 
@@ -105,17 +126,25 @@ impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
                 jobs.push((book, w));
             }
         }
-        let results = jobs.into_par_iter().map(|(book, w)| update(book, w)).collect();
+        let results = jobs.into_par_iter().map(|(book, w)| update(Arc::make_mut(book), w)).collect();
         (results, work)
     }
 
-    /// Same result as `clone()`, with the per-coin books cloned in parallel.
-    #[must_use]
-    pub(crate) fn par_clone(&self) -> Self {
-        Self {
-            order_books: self.order_books.par_iter().map(|(c, book)| (c.clone(), book.clone())).collect(),
-            changed: self.changed.clone(),
-        }
+    /// The books of the coins `keep` accepts with every order mapped by `f`,
+    /// built in parallel; all of them count as changed.
+    pub(crate) fn par_map<P: InnerOrder + Send + Sync>(
+        &self,
+        keep: impl Fn(&Coin) -> bool + Sync,
+        f: impl Fn(&O) -> P + Sync,
+    ) -> OrderBooks<P> {
+        let order_books: BTreeMap<_, _> = self
+            .order_books
+            .par_iter()
+            .filter(|(coin, _)| keep(coin))
+            .map(|(coin, book)| (coin.clone(), Arc::new(book.map_orders(&f))))
+            .collect();
+        let changed = order_books.keys().cloned().collect();
+        OrderBooks { order_books, changed }
     }
 }
 
@@ -394,7 +423,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod par_clone_test {
+mod clone_test {
     use super::*;
     use crate::types::{L4Order, inner::InnerL4Order};
     use alloy::primitives::Address;
@@ -405,7 +434,7 @@ mod par_clone_test {
     const FIXTURE: &str = "tmp/fixture/out.snap.json";
 
     #[test]
-    fn par_clone_matches_clone_on_real_snapshot() {
+    fn clone_is_shallow_on_real_snapshot() {
         let Ok(json) = fs::read_to_string(FIXTURE) else {
             eprintln!("skipping: {FIXTURE} not present");
             return;
@@ -414,28 +443,25 @@ mod par_clone_test {
         drop(json);
         let books = OrderBooks::from_snapshots(snapshot, true);
         let n_orders: usize = books.order_books.values().map(|b| b.oid_to_side_px.len()).sum();
+        let n_levels: usize = books.order_books.values().map(|b| b.bids.len() + b.asks.len()).sum();
         assert!(books.order_books.len() > 100 && n_orders > 100_000, "fixture too small: {n_orders}");
 
         let start = Instant::now();
-        let serial = books.clone();
-        let serial_time = start.elapsed();
+        let copy = books.clone();
+        let clone_time = start.elapsed();
+        // What the first write to each book after a clone copies: its oid index and level map.
         let start = Instant::now();
-        let par = books.par_clone();
-        let par_time = start.elapsed();
-        let largest = books.order_books.values().map(|b| b.oid_to_side_px.len()).max().unwrap_or(0);
+        let shallow = books.order_books.values().map(|book| OrderBook::clone(book)).collect_vec();
+        let book_copy_time = start.elapsed();
         eprintln!(
-            "{} coins, {n_orders} orders (largest book {largest}): clone {serial_time:?}, par_clone {par_time:?} on {} threads",
+            "{} coins, {n_orders} orders in {n_levels} levels: clone {clone_time:?}; copying every book's index and level map {book_copy_time:?}",
             books.order_books.len(),
-            rayon::current_num_threads()
         );
-
-        assert_eq!(serial.order_books.keys().collect_vec(), par.order_books.keys().collect_vec());
-        for (coin, book) in &serial.order_books {
-            let other = &par.order_books[coin];
-            assert!(book.oid_to_side_px == other.oid_to_side_px, "{coin:?} oid index differs");
-            assert!(book.bids.keys().eq(other.bids.keys()), "{coin:?} bid levels differ");
-            assert!(book.asks.keys().eq(other.asks.keys()), "{coin:?} ask levels differ");
-            assert_eq!(book.to_snapshot().as_ref(), other.to_snapshot().as_ref(), "{coin:?} orders differ");
+        assert!(books.order_books.values().zip(copy.order_books.values()).all(|(a, b)| Arc::ptr_eq(a, b)));
+        for (book, copy) in books.order_books.values().zip(&shallow) {
+            assert!(book.oid_to_side_px == copy.oid_to_side_px);
+            assert!(book.bids.iter().zip(&copy.bids).all(|((pa, a), (pb, b))| pa == pb && Arc::ptr_eq(a, b)));
+            assert!(book.asks.iter().zip(&copy.asks).all(|((pa, a), (pb, b))| pa == pb && Arc::ptr_eq(a, b)));
         }
     }
 }

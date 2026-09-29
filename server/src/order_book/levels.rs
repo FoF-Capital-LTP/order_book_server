@@ -1,7 +1,6 @@
-use crate::order_book::{InnerOrder, OrderBook, PriceLevel, Px, Side, Snapshot};
+use crate::order_book::{InnerOrder, Levels, OrderBook, PriceLevel, Px, Side, Snapshot};
 use crate::types::Level;
 use crate::types::inner::InnerLevel;
-use std::collections::BTreeMap;
 
 #[must_use]
 fn bucket(px: Px, side: Side, n_sig_figs: Option<u32>, mantissa: Option<u64>) -> Px {
@@ -76,7 +75,7 @@ fn l2_levels_to_l2_levels(
 
 #[must_use]
 fn map_to_l2_levels<O: InnerOrder>(
-    orders: &BTreeMap<Px, PriceLevel<O>>,
+    orders: &Levels<O>,
     side: Side,
     n_levels: Option<usize>,
     n_sig_figs: Option<u32>,
@@ -88,8 +87,8 @@ fn map_to_l2_levels<O: InnerOrder>(
     }
     let mut cur_level: Option<InnerLevel> = None;
     let order_iter: Box<dyn Iterator<Item = (&Px, &PriceLevel<O>)>> = match side {
-        Side::Ask => Box::new(orders.iter()),
-        Side::Bid => Box::new(orders.iter().rev()),
+        Side::Ask => Box::new(orders.iter().map(|(px, level)| (px, level.as_ref()))),
+        Side::Bid => Box::new(orders.iter().rev().map(|(px, level)| (px, level.as_ref()))),
     };
     for (px, level) in order_iter {
         if build_l2_level(

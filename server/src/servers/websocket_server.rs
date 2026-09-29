@@ -77,7 +77,7 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
         get({
             let internal_message_tx = internal_message_tx.clone();
             async move |ws_upgrade| {
-                ws_handler(ws_upgrade, internal_message_tx.clone(), listener.clone(), ignore_spot, websocket_opts)
+                ws_handler(ws_upgrade, internal_message_tx.clone(), listener.clone(), websocket_opts)
             }
         }),
     );
@@ -102,7 +102,6 @@ fn ws_handler(
     incoming: yawc::IncomingUpgrade,
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
-    ignore_spot: bool,
     websocket_opts: yawc::Options,
 ) -> impl IntoResponse {
     let (resp, fut) = incoming.upgrade(websocket_opts).unwrap();
@@ -115,7 +114,7 @@ fn ws_handler(
             }
         };
 
-        handle_socket(ws, internal_message_tx, listener, ignore_spot).await
+        handle_socket(ws, internal_message_tx, listener).await
     });
 
     resp
@@ -125,13 +124,11 @@ async fn handle_socket(
     mut socket: WebSocket,
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
-    ignore_spot: bool,
 ) {
     let mut internal_message_rx = internal_message_tx.subscribe();
     let (is_ready, mut universe, l2_demand) = {
         let listener = listener.lock().await;
-        let universe: Arc<HashSet<String>> = Arc::new(listener.universe().into_iter().map(|c| c.value()).collect());
-        (listener.is_ready(), universe, listener.l2_demand())
+        (listener.is_ready(), listener.universe(), listener.l2_demand())
     };
     let mut manager = SubscriptionManager::default();
     // Dropped on every return below, which releases this client's sig-fig L2 demand.
@@ -150,8 +147,8 @@ async fn handle_socket(
                         let handle_start = Instant::now();
                         // (histogram, hl-node write time) for each stream of this message the client subscribes to
                         let delivered: [Option<(&latency::Histogram, u64)>; 2] = match msg.as_ref() {
-                            InternalMessage::Snapshot{ l2_snapshots, time, local_time_us, shared } => {
-                                universe = shared.universe(l2_snapshots, ignore_spot);
+                            InternalMessage::Snapshot{ l2_snapshots, time, local_time_us, shared, universe: coins } => {
+                                universe = coins.clone();
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots, *time, shared).await;
                                 }
@@ -357,27 +354,17 @@ async fn feed_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
     }
 }
 
-// derive it from l2_snapshots because thats convenient
-fn new_universe(l2_snapshots: &L2Snapshots, ignore_spot: bool) -> HashSet<String> {
-    l2_snapshots
-        .as_ref()
-        .iter()
-        .filter_map(|(c, _)| if !c.is_spot() || !ignore_spot { Some(c.clone().value()) } else { None })
-        .collect()
-}
-
 /// (coin, n_sig_figs, mantissa, n_levels) of an L2Book subscription.
 type L2FrameKey = (String, Option<u32>, Option<u64>, usize);
 
-/// Work shared by all clients handling the same snapshot message: the
-/// universe and each distinct L2Book response are built once, not per client.
+/// Work shared by all clients handling the same snapshot message: each
+/// distinct L2Book response is built once, not per client.
 ///
 /// Keys some client requested for the previous snapshot are looked up without
 /// a lock; only keys new in this snapshot go through the mutex. One mutex for
 /// every lookup cost ~30% of obs CPU in futex contention (perf, 2026-09-28).
 #[derive(Default)]
 pub(crate) struct SnapshotShared {
-    universe: OnceLock<Arc<HashSet<String>>>,
     /// Keys requested for the previous snapshot. None: the coin or params are not in the snapshot.
     known: HashMap<Arc<L2FrameKey>, OnceLock<Option<FrameView>>>,
     /// Keys first requested for this snapshot.
@@ -397,11 +384,7 @@ impl SnapshotShared {
             .map(|(key, _)| (key.clone(), OnceLock::new()))
             .collect();
         known.extend(prev.new.lock().unwrap().keys().map(|key| (key.clone(), OnceLock::new())));
-        Self { universe: OnceLock::new(), known, new: std::sync::Mutex::default() }
-    }
-
-    fn universe(&self, l2_snapshots: &L2Snapshots, ignore_spot: bool) -> Arc<HashSet<String>> {
-        self.universe.get_or_init(|| Arc::new(new_universe(l2_snapshots, ignore_spot))).clone()
+        Self { known, new: std::sync::Mutex::default() }
     }
 
     /// The serialized L2Book response for `key`. For a new key serialization
@@ -435,12 +418,11 @@ async fn send_ws_data_from_snapshot(
 ) {
     if let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription {
         let key = (coin.clone(), *n_sig_figs, *mantissa, n_levels.unwrap_or(DEFAULT_LEVELS));
+        // Snapshots are only computed for the coins and variants some client wants
+        // (see `L2Demand`); this one may predate the subscription. The next has it.
         let Some(coin_snapshots) = l2_snapshots.as_ref().get(&Coin::new(coin)) else {
-            error!("Coin {coin} not found");
             return;
         };
-        // Sig-fig variants are only computed while some client wants them (see
-        // `L2Demand`); this snapshot may predate the subscription. The next has it.
         if !coin_snapshots.contains_key(&L2SnapshotParams::new(*n_sig_figs, *mantissa)) {
             return;
         }
@@ -947,10 +929,6 @@ mod l2_frame_test {
         let l2_snapshots = compute_l2_snapshots(&OrderBooks::from_snapshots(snapshot, true));
         let time = 1_790_000_000_123;
         let shared = SnapshotShared::default();
-
-        let universe = shared.universe(&l2_snapshots, true);
-        assert_eq!(*universe, new_universe(&l2_snapshots, true));
-        assert!(Arc::ptr_eq(&universe, &shared.universe(&l2_snapshots, true)));
 
         let params = [
             (None, None),

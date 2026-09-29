@@ -1,10 +1,6 @@
 use crate::{
-    listeners::order_book::{
-        CoinL2Snapshots, L2Snapshots,
-        utils::{compute_coin_l2_snapshots, compute_coin_raw_l2_snapshot},
-    },
     order_book::{
-        Coin, InnerOrder, Oid, OrderBook, Px, Snapshot,
+        Coin, InnerOrder, Oid, OrderBook, Px, Snapshot, Sz,
         multi_book::{OrderBooks, Snapshots},
     },
     prelude::*,
@@ -14,13 +10,9 @@ use crate::{
     },
 };
 use log::warn;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 /// Don't re-warn about the same not-yet-grafted coin more often than this
@@ -37,7 +29,6 @@ pub(super) struct OrderBookState {
     order_book: OrderBooks<InnerL4Order>,
     height: u64,
     time: u64,
-    snapped: bool,
     ignore_spot: bool,
     /// When true, the next forward block gap is tolerated (height jumps
     /// forward) instead of triggering a fatal. Set to true after snapshot
@@ -50,9 +41,6 @@ pub(super) struct OrderBookState {
     /// Throttle map for "skipping <Op> for not-yet-grafted coin" warnings.
     /// Value is the block height at which we last warned for that coin.
     not_yet_grafted_last_warn: HashMap<Coin, u64>,
-    /// L2 variants per coin as of the last `l2_snapshots`; only coins that
-    /// `order_book.take_changed()` reports are recomputed.
-    l2_cache: HashMap<Coin, Arc<CoinL2Snapshots>>,
 }
 
 impl OrderBookState {
@@ -68,10 +56,8 @@ impl OrderBookState {
             time,
             height,
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
-            snapped: false,
             allow_initial_gap: true,
             not_yet_grafted_last_warn: HashMap::new(),
-            l2_cache: HashMap::new(),
         }
     }
 
@@ -94,6 +80,23 @@ impl OrderBookState {
         self.height
     }
 
+    pub(super) const fn time(&self) -> u64 {
+        self.time
+    }
+
+    pub(super) const fn ignore_spot(&self) -> bool {
+        self.ignore_spot
+    }
+
+    pub(super) const fn books(&self) -> &OrderBooks<InnerL4Order> {
+        &self.order_book
+    }
+
+    /// Coins whose book may have changed since the previous call.
+    pub(super) fn take_changed(&mut self) -> HashSet<Coin> {
+        self.order_book.take_changed()
+    }
+
     // forcibly take snapshot of all books
     pub(super) fn compute_snapshot(&self) -> Snapshots<InnerL4Order> {
         self.order_book.to_snapshots_par()
@@ -101,85 +104,6 @@ impl OrderBookState {
 
     pub(super) fn compute_coin_snapshot(&self, coin: &Coin) -> Option<(u64, u64, Snapshot<InnerL4Order>)> {
         self.order_book.as_ref().get(coin).map(|book| (self.time, self.height, book.to_snapshot()))
-    }
-
-    /// Same as `clone()`, but clones the per-coin books in parallel.
-    pub(super) fn par_clone(&self) -> Self {
-        Self {
-            order_book: self.order_book.par_clone(),
-            height: self.height,
-            time: self.time,
-            snapped: self.snapped,
-            ignore_spot: self.ignore_spot,
-            allow_initial_gap: self.allow_initial_gap,
-            not_yet_grafted_last_warn: self.not_yet_grafted_last_warn.clone(),
-            l2_cache: self.l2_cache.clone(),
-        }
-    }
-
-    // (time, snapshot). Coins in `aggregated` get every L2 variant, the rest only the raw one.
-    pub(super) fn l2_snapshots(
-        &mut self,
-        prevent_future_snaps: bool,
-        aggregated: &HashSet<Coin>,
-    ) -> Option<(u64, L2Snapshots)> {
-        if self.snapped {
-            None
-        } else {
-            self.snapped = prevent_future_snaps || self.snapped;
-            let start = std::time::Instant::now();
-            let snapshots = self.update_l2_cache(aggregated);
-            crate::latency::L2_COMPUTE_US.record_duration_us(start.elapsed());
-            crate::latency::L2_AGGREGATED_COINS.record(aggregated.len() as u64);
-            Some((self.time, snapshots))
-        }
-    }
-
-    /// Recomputes the L2 variants of the books changed since the last call
-    /// (all books on the first call), plus coins in `aggregated` whose entry
-    /// has only the raw variant, and returns the whole cache. Every entry is
-    /// computed in one go from the book as of its last change, so a coin that
-    /// drops out of `aggregated` may keep correct aggregated variants until
-    /// its book next changes.
-    fn update_l2_cache(&mut self, aggregated: &HashSet<Coin>) -> L2Snapshots {
-        let changed = self.order_book.take_changed();
-        let books = self.order_book.as_ref();
-        let lacks_aggregates = |coin: &Coin, entry: &CoinL2Snapshots| entry.len() == 1 && aggregated.contains(coin);
-        let stale: Vec<_> = if self.l2_cache.len() == books.len() {
-            let lacking = aggregated.iter().filter(|coin| {
-                !changed.contains(*coin) && self.l2_cache.get(*coin).is_some_and(|entry| lacks_aggregates(coin, entry))
-            });
-            changed.iter().chain(lacking).filter_map(|coin| books.get_key_value(coin)).collect()
-        } else {
-            books
-                .iter()
-                .filter(|(coin, _)| {
-                    changed.contains(*coin)
-                        || self.l2_cache.get(*coin).is_none_or(|entry| lacks_aggregates(coin, entry))
-                })
-                .collect()
-        };
-        let fresh: Vec<_> = stale
-            .par_iter()
-            .map(|(coin, book)| {
-                let snapshots = if aggregated.contains(*coin) {
-                    compute_coin_l2_snapshots(book)
-                } else {
-                    compute_coin_raw_l2_snapshot(book)
-                };
-                ((*coin).clone(), Arc::new(snapshots))
-            })
-            .collect();
-        self.l2_cache.extend(fresh);
-        if self.l2_cache.len() != books.len() {
-            // Books are never removed today; keep the cache exact regardless.
-            self.l2_cache.retain(|coin, _| books.contains_key(coin));
-        }
-        L2Snapshots(self.l2_cache.clone())
-    }
-
-    pub(super) fn compute_universe(&self) -> HashSet<Coin> {
-        self.order_book.as_ref().keys().cloned().collect()
     }
 
     /// Graft fetched snapshots for previously-untracked coins into local state.
@@ -257,14 +181,10 @@ impl OrderBookState {
         // Books are independent, so each coin's diffs (in block order) are applied in
         // parallel; serially this was 3.8 ms p50 / 18 ms p99 under the listener mutex
         // (2026-09-28), spread over ~140 coins per block.
-        let mut work: HashMap<&str, CoinUpdates<'_>> = HashMap::new();
-        for diff in order_diffs.events_ref() {
-            let coin = diff.coin_str();
-            if self.ignore_spot && diff.coin().is_spot() {
-                continue;
-            }
-            work.entry(coin).or_default().diffs.push(diff);
-        }
+        let mut work: HashMap<&str, CoinUpdates<'_>> = group_diffs_by_coin(order_diffs, self.ignore_spot)
+            .into_iter()
+            .map(|(coin, diffs)| (coin, CoinUpdates { diffs, opening_statuses: HashMap::new() }))
+            .collect();
         for status in order_statuses.events_ref() {
             if status.is_inserted_into_book() {
                 if let Some(updates) = work.get_mut(status.order.coin.as_str()) {
@@ -272,61 +192,94 @@ impl OrderBookState {
                 }
             }
         }
-        let (results, untracked) = self.order_book.par_update_books(work, |book, updates| {
-            apply_coin_updates(&mut CoinBook::Tracked(book), updates).map(|skipped| debug_assert!(skipped.is_none()))
-        });
-        results.into_iter().collect::<Result<()>>()?;
-        // Coins without a book yet: a newly-listed coin gets one from its first New diff.
-        for (coin, updates) in untracked {
-            let coin = Coin::new(coin);
-            let mut book = CoinBook::Untracked(None);
-            let skipped = apply_coin_updates(&mut book, updates)?;
-            if let Some((op, oid)) = skipped {
-                // If the book is not tracked yet, this is a newly-listed coin whose
-                // snapshot has not been grafted via absorb_extra_books. Skip — the
-                // next fetch_snapshot will absorb it and bring local state into sync.
-                // Hard-erroring here would crash the listener for a benign add.
-                if self.should_warn_not_yet_grafted(&coin, height) {
-                    warn!(
-                        "Skipping {op} for not-yet-grafted coin {} oid {oid:?} at block {height}; waiting for absorb_extra_books",
-                        coin.value(),
-                    );
-                }
-            }
-            if let CoinBook::Untracked(Some(book)) = book {
-                self.order_book.add_book(coin, *book);
+        let skipped = apply_block(&mut self.order_book, work, |book, updates| {
+            let CoinUpdates { diffs, mut opening_statuses } = updates;
+            apply_coin_updates(book, &diffs, |book, diff, sz, insert_before| {
+                rest_l4_order(book, diff, sz, insert_before, &mut opening_statuses)
+            })
+        })?;
+        for (coin, op, oid) in skipped {
+            // If the book is not tracked yet, this is a newly-listed coin whose
+            // snapshot has not been grafted via absorb_extra_books. Skip — the
+            // next fetch_snapshot will absorb it and bring local state into sync.
+            // Hard-erroring here would crash the listener for a benign add.
+            if self.should_warn_not_yet_grafted(&coin, height) {
+                warn!(
+                    "Skipping {op} for not-yet-grafted coin {} oid {oid:?} at block {height}; waiting for absorb_extra_books",
+                    coin.value(),
+                );
             }
         }
         self.height += 1;
         self.time = time;
-        self.snapped = false;
         Ok(())
     }
 }
 
+/// A block's diffs by coin, each coin's in block order; spot coins dropped if `ignore_spot`.
+pub(super) fn group_diffs_by_coin(
+    order_diffs: &Batch<NodeDataOrderDiff>,
+    ignore_spot: bool,
+) -> HashMap<&str, Vec<&NodeDataOrderDiff>> {
+    let mut work: HashMap<&str, Vec<_>> = HashMap::new();
+    for diff in order_diffs.events_ref() {
+        let coin = diff.coin_str();
+        if ignore_spot && Coin::is_spot_str(coin) {
+            continue;
+        }
+        work.entry(coin).or_default().push(diff);
+    }
+    work
+}
+
+/// Applies each coin's share of a block (`work`) to `books` with `apply`, coins
+/// in parallel. A coin without a book gets one from its first New diff; returns
+/// the first Update/Remove skipped for each coin still without one.
+pub(super) fn apply_block<O: InnerOrder + Send + Sync, W: Send>(
+    books: &mut OrderBooks<O>,
+    work: HashMap<&str, W>,
+    apply: impl Fn(&mut CoinBook<'_, O>, W) -> Result<Option<(&'static str, Oid)>> + Sync,
+) -> Result<Vec<(Coin, &'static str, Oid)>> {
+    let (results, untracked) = books.par_update_books(work, |book, w| {
+        apply(&mut CoinBook::Tracked(book), w).map(|skipped| debug_assert!(skipped.is_none()))
+    });
+    results.into_iter().collect::<Result<()>>()?;
+    let mut skipped = Vec::new();
+    for (coin, w) in untracked {
+        let coin = Coin::new(coin);
+        let mut book = CoinBook::Untracked(None);
+        if let Some((op, oid)) = apply(&mut book, w)? {
+            skipped.push((coin.clone(), op, oid));
+        }
+        if let CoinBook::Untracked(Some(book)) = book {
+            books.add_book(coin, *book);
+        }
+    }
+    Ok(skipped)
+}
+
 /// One coin's share of a block: its diffs in block order, and the statuses of
 /// orders that rest on the book (by oid) for its New diffs.
-#[derive(Default)]
 struct CoinUpdates<'a> {
     diffs: Vec<&'a NodeDataOrderDiff>,
     opening_statuses: HashMap<Oid, &'a NodeDataOrderStatus>,
 }
 
-enum CoinBook<'b> {
-    Tracked(&'b mut OrderBook<InnerL4Order>),
+pub(super) enum CoinBook<'b, O> {
+    Tracked(&'b mut OrderBook<O>),
     /// Not tracked yet; Some once a New diff created the book.
-    Untracked(Option<Box<OrderBook<InnerL4Order>>>),
+    Untracked(Option<Box<OrderBook<O>>>),
 }
 
-impl CoinBook<'_> {
-    fn get(&mut self) -> Option<&mut OrderBook<InnerL4Order>> {
+impl<O: InnerOrder> CoinBook<'_, O> {
+    fn get(&mut self) -> Option<&mut OrderBook<O>> {
         match self {
             CoinBook::Tracked(book) => Some(book),
             CoinBook::Untracked(book) => book.as_deref_mut(),
         }
     }
 
-    fn get_or_create(&mut self) -> &mut OrderBook<InnerL4Order> {
+    fn get_or_create(&mut self) -> &mut OrderBook<O> {
         match self {
             CoinBook::Tracked(book) => book,
             CoinBook::Untracked(book) => book.get_or_insert_with(|| Box::new(OrderBook::new())),
@@ -334,39 +287,20 @@ impl CoinBook<'_> {
     }
 }
 
-/// Applies one coin's diffs. Returns the first Update/Remove skipped because the coin
-/// has no book yet (only possible for `CoinBook::Untracked`).
-fn apply_coin_updates(book: &mut CoinBook<'_>, updates: CoinUpdates<'_>) -> Result<Option<(&'static str, Oid)>> {
-    let CoinUpdates { diffs, mut opening_statuses } = updates;
+/// Applies one coin's diffs; `rest` puts the order of a New diff (with its size
+/// and insertBefore anchor) on the book. Returns the first Update/Remove skipped
+/// because the coin has no book yet (only possible for `CoinBook::Untracked`).
+pub(super) fn apply_coin_updates<O: InnerOrder>(
+    book: &mut CoinBook<'_, O>,
+    diffs: &[&NodeDataOrderDiff],
+    mut rest: impl FnMut(&mut OrderBook<O>, &NodeDataOrderDiff, Sz, Option<Oid>) -> Result<()>,
+) -> Result<Option<(&'static str, Oid)>> {
     let mut skipped = None;
-    for diff in diffs {
+    for &diff in diffs {
         let oid = diff.oid();
         let inner_diff = diff.diff().try_into()?;
         match inner_diff {
-            InnerOrderDiff::New { sz, insert_before } => {
-                let Some(order) = opening_statuses.remove(&oid) else {
-                    return Err(format!("Unable to find order opening status {diff:?}").into());
-                };
-                let time = order.time.and_utc().timestamp_millis();
-                let mut inner_order: InnerL4Order = order.clone().try_into()?;
-                inner_order.modify_sz(sz);
-                // must replace time with time of entering book, which is the timestamp of the order status update
-                #[allow(clippy::unwrap_used)]
-                inner_order.convert_trigger(time.try_into().unwrap());
-                // For stop market/limit triggers, status.order.limitPx is the trigger
-                // condition price, not the resting price on the book. The actual price
-                // the order rests at is on the diff event itself. For ordinary limit
-                // orders the two are equal, so this is a no-op there.
-                inner_order.limit_px = Px::parse_from_str(diff.px())?;
-                // A missing insertBefore anchor only misplaces the order within its
-                // level (sizes and L2 stay right), so warn rather than fail the listener.
-                if !book.get_or_create().add_order_before(inner_order, insert_before) {
-                    let misses = INSERT_BEFORE_MISSES.fetch_add(1, Ordering::Relaxed) + 1;
-                    if misses.is_power_of_two() {
-                        warn!("insertBefore anchor not on the book, rested at the back of its level ({misses} so far) {diff:?}");
-                    }
-                }
-            }
+            InnerOrderDiff::New { sz, insert_before } => rest(book.get_or_create(), diff, sz, insert_before)?,
             InnerOrderDiff::Update { new_sz, .. } => {
                 let Some(book) = book.get() else {
                     skipped = skipped.or(Some(("Update", oid)));
@@ -390,13 +324,45 @@ fn apply_coin_updates(book: &mut CoinBook<'_>, updates: CoinUpdates<'_>) -> Resu
     Ok(skipped)
 }
 
+/// Rests the order of a New diff, built from its opening status.
+fn rest_l4_order(
+    book: &mut OrderBook<InnerL4Order>,
+    diff: &NodeDataOrderDiff,
+    sz: Sz,
+    insert_before: Option<Oid>,
+    opening_statuses: &mut HashMap<Oid, &NodeDataOrderStatus>,
+) -> Result<()> {
+    let Some(order) = opening_statuses.remove(&diff.oid()) else {
+        return Err(format!("Unable to find order opening status {diff:?}").into());
+    };
+    let time = order.time.and_utc().timestamp_millis();
+    let mut inner_order: InnerL4Order = order.clone().try_into()?;
+    inner_order.modify_sz(sz);
+    // must replace time with time of entering book, which is the timestamp of the order status update
+    #[allow(clippy::unwrap_used)]
+    inner_order.convert_trigger(time.try_into().unwrap());
+    // For stop market/limit triggers, status.order.limitPx is the trigger
+    // condition price, not the resting price on the book. The actual price
+    // the order rests at is on the diff event itself. For ordinary limit
+    // orders the two are equal, so this is a no-op there.
+    inner_order.limit_px = Px::parse_from_str(diff.px())?;
+    // A missing insertBefore anchor only misplaces the order within its
+    // level (sizes and L2 stay right), so warn rather than fail the listener.
+    if !book.add_order_before(inner_order, insert_before) {
+        let misses = INSERT_BEFORE_MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+        if misses.is_power_of_two() {
+            warn!("insertBefore anchor not on the book, rested at the back of its level ({misses} so far) {diff:?}");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod real_snapshot_test {
     use super::*;
     use crate::{
-        listeners::order_book::utils::{compute_coin_l2_snapshots_full_depth, compute_l2_snapshots},
         order_book::multi_book::load_snapshots_from_str,
-        types::{L4Order, OrderDiff, inner::InnerLevel, subscription::MAX_LEVELS},
+        types::{L4Order, OrderDiff},
     };
     use alloy::primitives::Address;
     use std::time::{Duration, Instant};
@@ -407,16 +373,10 @@ mod real_snapshot_test {
     /// `apply_updates` inserts into the book). Test-only, not committed.
     const REPLAY_BLOCKS: &str = "tmp/fixture/replay_blocks.jsonl";
 
-    fn same_l2(a: &Snapshot<InnerLevel>, b: &Snapshot<InnerLevel>) -> bool {
-        a.as_ref().iter().zip(b.as_ref()).all(|(a, b)| {
-            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.px == b.px && a.sz == b.sz && a.n == b.n)
-        })
-    }
-
-    /// The incremental L2 cache must equal a full recompute after every real block,
-    /// with sig-fig variants present for every coin some client wants them for.
+    /// Replays real blocks: every insertBefore order queues ahead of its anchor,
+    /// level sizes stay consistent, and a grafted book is picked up.
     #[test]
-    fn incremental_l2_matches_full_recompute_on_real_blocks() {
+    fn l4_replay_on_real_blocks() {
         let (Ok(json), Ok(blocks)) = (fs::read_to_string(FIXTURE), fs::read_to_string(REPLAY_BLOCKS)) else {
             eprintln!("skipping: {FIXTURE} or {REPLAY_BLOCKS} not present");
             return;
@@ -424,16 +384,7 @@ mod real_snapshot_test {
         let (height, snapshot) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json).unwrap();
         drop(json);
         let mut state = OrderBookState::from_snapshot(snapshot, height, 0, true, true);
-        let coins = |names: &[&str]| names.iter().map(|c| Coin::new(c)).collect::<HashSet<_>>();
-        // Demand changes mid-stream: SOL and a quiet coin join at block 100, ETH leaves at 300.
-        let mut aggregated = coins(&["BTC", "ETH"]);
-        let first = state.l2_snapshots(true, &aggregated).unwrap().1;
-        assert!(state.l2_snapshots(true, &aggregated).is_none(), "snapped state must not re-snapshot");
-        assert_eq!(first.as_ref().values().filter(|e| e.len() > 1).count(), 2);
-        let mut prev: HashMap<Coin, Arc<CoinL2Snapshots>> = first.as_ref().clone();
-        let n_coins = prev.len();
-        let (mut n_blocks, mut n_recomputed, mut incr_time, mut full_time) = (0, 0, Duration::ZERO, Duration::ZERO);
-        let (mut n_insert_before, mut n_ahead_checked, mut n_aggregated_entries) = (0, 0, 0);
+        let (mut n_blocks, mut n_insert_before, mut n_ahead_checked) = (0, 0, 0);
         let mut apply_time = Duration::ZERO;
         let mut lines = blocks.lines();
         while let (Some(statuses), Some(diffs)) = (lines.next(), lines.next()) {
@@ -444,6 +395,8 @@ mod real_snapshot_test {
             state.apply_updates(&statuses, &diffs).unwrap();
             apply_time += start.elapsed();
             n_blocks += 1;
+            let changed = state.take_changed();
+            assert!(diffs.events_ref().iter().all(|diff| diff.coin().is_spot() || changed.contains(&diff.coin())));
 
             // An insertBefore order must queue ahead of its anchor while both still rest.
             let mut books = HashMap::new();
@@ -463,72 +416,21 @@ mod real_snapshot_test {
                 // A newly-listed coin grafted mid-stream, and an existing book replaced.
                 let btc = state.compute_coin_snapshot(&Coin::new("BTC")).unwrap().2;
                 let sol = state.compute_coin_snapshot(&Coin::new("SOL")).unwrap().2;
-                let extras = HashMap::from([(Coin::new("NEWCOIN"), btc), (Coin::new("SOL"), sol)]);
+                let extras = HashMap::from([(Coin::new("NEWCOIN"), btc.clone()), (Coin::new("SOL"), sol)]);
                 state.absorb_extra_books(extras, true);
+                assert_eq!(state.take_changed(), HashSet::from([Coin::new("NEWCOIN"), Coin::new("SOL")]));
+                assert_eq!(state.compute_coin_snapshot(&Coin::new("NEWCOIN")).unwrap().2.as_ref(), btc.as_ref());
             }
-
-            if n_blocks == 100 {
-                // The quietest coin: its book likely does not change for a while.
-                let quiet = state.order_book.as_ref().iter().min_by_key(|(_, b)| b.to_snapshot().as_ref().iter().map(Vec::len).sum::<usize>()).unwrap().0;
-                aggregated.extend([Coin::new("SOL"), quiet.clone()]);
-            }
-            if n_blocks == 300 {
-                aggregated.remove(&Coin::new("ETH"));
-            }
-            let start = Instant::now();
-            let (_, incremental) = state.l2_snapshots(true, &aggregated).unwrap();
-            incr_time += start.elapsed();
-            let start = Instant::now();
-            let full = compute_l2_snapshots(&state.order_book);
-            full_time += start.elapsed();
-
-            let (incremental, full) = (incremental.as_ref(), full.as_ref());
-            assert_eq!(incremental.len(), full.len(), "block {}", state.height);
-            for (coin, expected) in full {
-                let got = &incremental[coin];
-                // Wanted coins have every variant; others the raw one, or every variant
-                // (correct for the current book) until the book next changes.
-                assert!(got.len() == expected.len() || (got.len() == 1 && !aggregated.contains(coin)), "{coin:?}");
-                for (params, got) in got.iter() {
-                    assert!(same_l2(got, &expected[params]), "block {} {coin:?} {params:?} differs", state.height);
-                }
-                n_aggregated_entries += usize::from(got.len() > 1);
-                match prev.get(coin) {
-                    Some(old) if Arc::ptr_eq(old, got) => {}
-                    _ => n_recomputed += 1,
-                }
-            }
-            prev = incremental.clone();
-
             for book in state.order_book.as_ref().values() {
                 book.assert_level_sizes();
             }
-            if n_blocks % 10 == 1 {
-                // Every variant equals the old full-depth chain cut to what clients can request.
-                for (coin, book) in state.order_book.as_ref() {
-                    let got = &incremental[coin];
-                    let expected = compute_coin_l2_snapshots_full_depth(book);
-                    for (params, got) in got.iter() {
-                        let expected = expected[params].truncate(MAX_LEVELS);
-                        assert!(got.as_ref().iter().all(|side| side.len() <= MAX_LEVELS));
-                        assert!(same_l2(got, &expected), "block {} {coin:?} {params:?} differs", state.height);
-                    }
-                }
-            }
         }
         assert_eq!(n_blocks, 400, "fixture should hold 400 blocks");
-        assert_eq!(state.l2_cache[&Coin::new("ETH")].len(), 1, "ETH lost its demand and changed since");
-        assert!(aggregated.iter().all(|coin| state.l2_cache[coin].len() > 1));
         assert_eq!(INSERT_BEFORE_MISSES.load(Ordering::Relaxed), 0, "every insertBefore anchor should be on the book");
         assert!(n_ahead_checked > 0);
-        eprintln!("{n_insert_before} insertBefore diffs, {n_ahead_checked} checked queued ahead of their anchor");
         eprintln!(
-            "{n_blocks} blocks, {n_coins} coins: {:.1} coins recomputed, {:.1} with sig-fig variants per block; apply {:?}/block; l2 incremental {:?}/block vs full {:?}/block",
-            n_recomputed as f64 / f64::from(n_blocks),
-            n_aggregated_entries as f64 / f64::from(n_blocks),
+            "{n_blocks} blocks: apply {:?}/block; {n_insert_before} insertBefore diffs, {n_ahead_checked} checked queued ahead of their anchor",
             apply_time / n_blocks,
-            incr_time / n_blocks,
-            full_time / n_blocks,
         );
     }
 
@@ -621,15 +523,14 @@ mod real_snapshot_test {
     }
 
     #[test]
-    fn coin_snapshot_and_par_clone_match_full_state() {
-        let Ok(json) = fs::read_to_string(FIXTURE) else {
-            eprintln!("skipping: {FIXTURE} not present");
+    fn coin_snapshot_and_clone_match_full_state() {
+        let (Ok(json), Ok(blocks)) = (fs::read_to_string(FIXTURE), fs::read_to_string(REPLAY_BLOCKS)) else {
+            eprintln!("skipping: {FIXTURE} or {REPLAY_BLOCKS} not present");
             return;
         };
         let (height, snapshot) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json).unwrap();
         drop(json);
         let mut state = OrderBookState::from_snapshot(snapshot, height, 1234, true, true);
-        state.snapped = true;
         state.not_yet_grafted_last_warn.insert(Coin::new("NEWCOIN"), 7);
         let full = state.compute_snapshot();
         assert!(full.as_ref().len() > 100);
@@ -642,18 +543,27 @@ mod real_snapshot_test {
         }
         assert!(state.compute_coin_snapshot(&Coin::new("NO_SUCH_COIN")).is_none());
 
-        let (serial, par) = (state.clone(), state.par_clone());
-        for copy in [&serial, &par] {
-            assert_eq!(
-                (copy.height, copy.time, copy.snapped, copy.ignore_spot, copy.allow_initial_gap),
-                (state.height, state.time, state.snapped, state.ignore_spot, state.allow_initial_gap)
-            );
-            assert_eq!(copy.not_yet_grafted_last_warn, state.not_yet_grafted_last_warn);
+        let copy = state.clone();
+        assert_eq!(
+            (copy.height, copy.time, copy.ignore_spot, copy.allow_initial_gap),
+            (state.height, state.time, state.ignore_spot, state.allow_initial_gap)
+        );
+        assert_eq!(copy.not_yet_grafted_last_warn, state.not_yet_grafted_last_warn);
+
+        // Books are shared copy-on-write: blocks applied to the original leave the copy as it was.
+        let mut lines = blocks.lines();
+        for _ in 0..20 {
+            let statuses: Batch<NodeDataOrderStatus> = serde_json::from_str(lines.next().unwrap()).unwrap();
+            let diffs: Batch<NodeDataOrderDiff> = serde_json::from_str(lines.next().unwrap()).unwrap();
+            state.apply_updates(&statuses, &diffs).unwrap();
         }
-        let (serial, par) = (serial.compute_snapshot(), par.compute_snapshot());
-        assert_eq!(serial.as_ref().len(), par.as_ref().len());
-        for (coin, expected) in serial.as_ref() {
-            assert_eq!(par.as_ref()[coin].as_ref(), expected.as_ref(), "{coin:?}");
+        let (copied, applied) = (copy.compute_snapshot(), state.compute_snapshot());
+        assert_eq!(copied.as_ref().len(), full.as_ref().len());
+        let mut n_changed = 0;
+        for (coin, expected) in full.as_ref() {
+            assert_eq!(copied.as_ref()[coin].as_ref(), expected.as_ref(), "{coin:?}");
+            n_changed += usize::from(applied.as_ref()[coin].as_ref() != expected.as_ref());
         }
+        assert!(n_changed > 10, "only {n_changed} books changed");
     }
 }

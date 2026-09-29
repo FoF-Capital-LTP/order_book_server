@@ -1,7 +1,10 @@
 use crate::{
     servers::websocket_server::SnapshotShared,
     latency,
-    listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
+    listeners::{
+        directory::DirectoryListener,
+        order_book::{l2_book::L2BookState, state::OrderBookState},
+    },
     order_book::{
         Coin, Snapshot,
         multi_book::{Snapshots, load_snapshots_from_json},
@@ -75,11 +78,15 @@ const PARSE_FAIL_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How often the lag watchdog runs. Independent of fs activity.
 const WATCHDOG_INTERVAL_SECS: u64 = 15;
+
+/// Coins the L2 book differed from the L4 book in since start (see `sync_l2`).
+static L2_DIVERGENT_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use utils::{BatchQueue, EventBatch, parse_event_line, process_rmp_file, validate_snapshot_consistency};
 pub(crate) use l2_demand::{ClientL2Demand, L2Demand};
 #[cfg(test)]
 pub(crate) use utils::compute_l2_snapshots;
 
+mod l2_book;
 mod l2_demand;
 mod state;
 mod utils;
@@ -344,9 +351,7 @@ fn fetch_snapshot(
                                         coins
                                     );
                                     let mut listener = listener.lock().await;
-                                    if let Some(state) = listener.order_book_state.as_mut() {
-                                        state.absorb_extra_books(extras, true);
-                                    }
+                                    listener.absorb_extra_books(extras);
                                 }
                             }
                             Ok(())
@@ -445,6 +450,9 @@ pub(crate) struct OrderBookListener {
     order_diff_file: Option<File>,
     // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
+    /// Kept from the diffs alone, so L2 snapshots go out before the block's
+    /// statuses arrive; None until rebuilt from `order_book_state` (see `sync_l2`).
+    l2_state: Option<L2BookState>,
     last_fill: Option<u64>,
     order_diff_cache: BatchQueue<NodeDataOrderDiff>,
     order_status_cache: BatchQueue<NodeDataOrderStatus>,
@@ -480,12 +488,11 @@ pub(crate) struct OrderBookListener {
     parse_fail_fills: ParseFailureTracker,
     parse_fail_order_statuses: ParseFailureTracker,
     parse_fail_order_diffs: ParseFailureTracker,
-    /// hl-node local_time (µs) of the last applied block; stamped on L2
-    /// snapshot messages so client tasks can measure delivery latency.
+    /// hl-node local_time (µs) of the last block applied to the L4 book.
     last_applied_local_time_us: u64,
     /// Of the last L2 snapshot message: tells the next one which frames clients want.
     last_snapshot_shared: Option<Arc<SnapshotShared>>,
-    /// Coins whose sig-fig L2 variants some client subscribes to.
+    /// Coins (and their L2 variants) some client subscribes to.
     l2_demand: Arc<L2Demand>,
 }
 
@@ -525,6 +532,7 @@ impl OrderBookListener {
             order_status_file: None,
             order_diff_file: None,
             order_book_state: None,
+            l2_state: None,
             last_fill: None,
             fetched_snapshot_cache: None,
             internal_message_tx,
@@ -618,18 +626,101 @@ impl OrderBookListener {
     }
 
     /// Copy of the state for snapshot validation. Runs under the listener
-    /// mutex every 60 s; a serial deep clone of all books stalled the listener
-    /// ~350-400 ms per minute (2026-09-27), so books are cloned in parallel.
+    /// mutex every 60 s: a deep clone of all books stalled the listener ~40 ms
+    /// even in parallel (2026-09-29); books are now shared copy-on-write.
     fn clone_state(&self) -> Option<OrderBookState> {
-        self.order_book_state.as_ref().map(OrderBookState::par_clone)
+        self.order_book_state.clone()
     }
 
     pub(crate) const fn is_ready(&self) -> bool {
         self.order_book_state.is_some()
     }
 
-    pub(crate) fn universe(&self) -> HashSet<Coin> {
-        self.order_book_state.as_ref().map_or_else(HashSet::new, OrderBookState::compute_universe)
+    /// Coins clients may subscribe to.
+    pub(crate) fn universe(&self) -> Arc<HashSet<String>> {
+        if let Some(l2) = &self.l2_state {
+            return l2.universe();
+        }
+        let Some(state) = &self.order_book_state else { return Arc::default() };
+        let coins = state.books().as_ref().keys().filter(|coin| !(self.ignore_spot && coin.is_spot()));
+        Arc::new(coins.map(Coin::value).collect())
+    }
+
+    /// Drops both books (they are rebuilt from the next snapshot).
+    fn clear_state(&mut self) {
+        self.order_book_state = None;
+        self.l2_state = None;
+    }
+
+    /// Applies a diffs line to the L2 book; on failure drops it, for `sync_l2` to rebuild.
+    fn apply_l2(&mut self, diffs: &Batch<NodeDataOrderDiff>) {
+        let Some(l2) = self.l2_state.as_mut() else { return };
+        let start = std::time::Instant::now();
+        match l2.apply(diffs) {
+            Ok(true) => latency::L2_APPLY_US.record_duration_us(start.elapsed()),
+            Ok(false) => {}
+            Err(err) => {
+                warn!("[l2-book] dropping the L2 book, to rebuild from the L4 book: {err}");
+                self.l2_state = None;
+            }
+        }
+    }
+
+    /// Checks the L2 book against the L4 book after the latter changed, or
+    /// rebuilds it from the L4 book if there is none.
+    fn sync_l2(&mut self) {
+        let Some(l4) = self.order_book_state.as_mut() else {
+            self.l2_state = None;
+            return;
+        };
+        let changed = l4.take_changed();
+        let l4 = &*l4;
+        if let Some(l2) = self.l2_state.as_mut() {
+            let start = std::time::Instant::now();
+            match l2.check(l4, changed, self.order_diff_cache.iter()) {
+                Ok(divergent) => {
+                    latency::L2_CHECK_US.record_duration_us(start.elapsed());
+                    if !divergent.is_empty() {
+                        let n = divergent.len() as u64;
+                        latency::L2_DIVERGENT_COINS.record(n);
+                        let prev = L2_DIVERGENT_TOTAL.fetch_add(n, AtomicOrdering::Relaxed);
+                        // Each time the total passes a power of two.
+                        if prev.checked_ilog2() != (prev + n).checked_ilog2() {
+                            warn!(
+                                "[l2-book] L2 book differed from the L4 book at block {}, rebuilt {divergent:?} ({} coins so far)",
+                                l4.height(),
+                                prev + n,
+                            );
+                        }
+                    }
+                    return;
+                }
+                Err(err) => warn!("[l2-book] rebuilding the L2 book from the L4 book: {err}"),
+            }
+        }
+        let start = std::time::Instant::now();
+        let local_time_us = self.last_applied_local_time_us;
+        let l2 = L2BookState::from_l4(l4, self.order_diff_cache.iter(), local_time_us).or_else(|err| {
+            warn!("[l2-book] L2 book rebuilt without the diffs of later blocks: {err}");
+            L2BookState::from_l4(l4, [], local_time_us)
+        });
+        latency::L2_REBUILD_US.record_duration_us(start.elapsed());
+        self.l2_state = l2.ok();
+    }
+
+    /// Grafts books of coins only the fetched snapshot has into both books.
+    fn absorb_extra_books(&mut self, extras: HashMap<Coin, Snapshot<InnerL4Order>>) {
+        let Some(l4) = self.order_book_state.as_mut() else { return };
+        let coins: HashSet<Coin> = extras.keys().cloned().collect();
+        l4.absorb_extra_books(extras, true);
+        let l4 = &*l4;
+        if let Some(l2) = self.l2_state.as_mut() {
+            if let Err(err) = l2.graft(l4, &coins, self.order_diff_cache.iter()) {
+                warn!("[l2-book] dropping the L2 book, to rebuild from the L4 book: {err}");
+                self.l2_state = None;
+            }
+        }
+        self.sync_l2();
     }
 
     #[allow(clippy::type_complexity)]
@@ -667,6 +758,7 @@ impl OrderBookListener {
             }
             EventBatch::BookDiffs(batch) => {
                 self.last_block_time_ms = Some(self.last_block_time_ms.map_or(batch.block_time(), |prev| prev.max(batch.block_time())));
+                self.apply_l2(&batch);
                 self.order_diff_cache.push(batch)?;
             }
             EventBatch::Fills(batch) => {
@@ -711,6 +803,7 @@ impl OrderBookListener {
                 if let Some(cache) = &mut self.fetched_snapshot_cache {
                     cache.push_back((order_statuses.clone(), order_diffs.clone()));
                 }
+                self.sync_l2();
             }
         }
         Ok(())
@@ -740,6 +833,7 @@ impl OrderBookListener {
         }
         if !retry {
             self.order_book_state = Some(new_order_book);
+            self.sync_l2();
             // Seed last_block_time_ms to wall-clock now. The snapshot gives us
             // authoritative state at this moment — there is no "real" lag yet.
             // Without this, the first parsed batch (which may have an old
@@ -763,20 +857,17 @@ impl OrderBookListener {
         self.order_book_state.as_ref().and_then(|o| o.compute_coin_snapshot(coin))
     }
 
-    /// Broadcasts the L2 snapshot of the current height unless already sent.
+    /// Broadcasts the L2 snapshot of the L2 book's height unless already sent.
     fn broadcast_l2_snapshot(&mut self) {
-        let Some((time, l2_snapshots)) = self.l2_snapshots(true) else { return };
+        let Some(l2) = self.l2_state.as_mut() else { return };
+        let Some((time, local_time_us, l2_snapshots, universe)) = l2.l2_snapshots(&self.l2_demand.coins()) else {
+            return;
+        };
         let Some(tx) = &self.internal_message_tx else { return };
         let shared = Arc::new(SnapshotShared::following(self.last_snapshot_shared.as_deref()));
         self.last_snapshot_shared = Some(shared.clone());
-        let local_time_us = self.last_applied_local_time_us;
-        let _unused = tx.send(Arc::new(InternalMessage::Snapshot { l2_snapshots, time, local_time_us, shared }));
-    }
-
-    // prevent snapshotting mutiple times at the same height
-    fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
-        let state = self.order_book_state.as_mut()?;
-        state.l2_snapshots(prevent_future_snaps, &self.l2_demand.coins())
+        let _unused =
+            tx.send(Arc::new(InternalMessage::Snapshot { l2_snapshots, time, local_time_us, shared, universe }));
     }
 }
 
@@ -955,7 +1046,7 @@ impl DirectoryListener for OrderBookListener {
                     // cleanly. This is NOT a fatal — the system self-heals
                     // within 60s (the snapshot fetch interval).
                     warn!("[gap-grace-resync] invalidating state; will re-init on next snapshot fetch");
-                    self.order_book_state = None;
+                    self.clear_state();
                     self.last_block_time_ms = None;
                     self.ready_at = None;
                     // Clear batch queues to prevent BatchQueue overflow while
@@ -964,7 +1055,7 @@ impl DirectoryListener for OrderBookListener {
                     self.order_diff_cache.clear();
                     return Ok(());
                 }
-                self.order_book_state = None;
+                self.clear_state();
                 return Err(err);
             }
         }
@@ -1017,7 +1108,7 @@ impl OrderBookListener {
                     if let Err(err) = self.receive_batch(event_batch) {
                         if err.to_string().contains("[gap-grace-resync]") {
                             warn!("[gap-grace-resync] invalidating state during stream_lines; will re-init on next snapshot fetch");
-                            self.order_book_state = None;
+                            self.clear_state();
                             self.last_block_time_ms = None;
                             self.ready_at = None;
                             self.order_status_cache.clear();
@@ -1025,7 +1116,7 @@ impl OrderBookListener {
                             // Stop draining — state is gone, remaining lines are useless
                             break;
                         }
-                        self.order_book_state = None;
+                        self.clear_state();
                         info!(
                             "[hour-rollover-diag] stream_lines receive_batch-error exit: source={event_source} lines_drained={lines_drained} first_height_seen={first_height_seen:?} last_height_seen={last_height_seen:?}"
                         );
@@ -1078,7 +1169,14 @@ impl L2Snapshots {
 // Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
     /// `local_time_us`: hl-node write time of the block this snapshot reflects.
-    Snapshot { l2_snapshots: L2Snapshots, time: u64, local_time_us: u64, shared: Arc<SnapshotShared> },
+    /// `universe`: coins clients may subscribe to.
+    Snapshot {
+        l2_snapshots: L2Snapshots,
+        time: u64,
+        local_time_us: u64,
+        shared: Arc<SnapshotShared>,
+        universe: Arc<HashSet<String>>,
+    },
     Fills { batch: Batch<NodeDataFill> },
     L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
 }
@@ -1115,7 +1213,7 @@ mod validation_test {
                 .map(|pair| (serde_json::from_str(pair[0]).unwrap(), serde_json::from_str(pair[1]).unwrap()))
                 .collect::<VecDeque<_>>()
         };
-        let mut later = state.par_clone();
+        let mut later = state.clone();
         for (statuses, diffs) in cache(20) {
             later.apply_updates(&statuses, &diffs).unwrap();
         }
@@ -1123,26 +1221,26 @@ mod validation_test {
         assert_eq!(later.height(), target);
 
         // Extra cached blocks past the snapshot height are left unapplied.
-        let validation = catch_up_and_validate(state.par_clone(), cache(30), target, later.compute_snapshot(), true);
+        let validation = catch_up_and_validate(state.clone(), cache(30), target, later.compute_snapshot(), true);
         assert!(matches!(&validation, Validation::Consistent(extras) if extras.is_empty()), "{validation:?}");
 
         // A book only the fetched snapshot has is handed back for grafting.
         let mut books = later.compute_snapshot().value();
         books.insert(Coin::new("NEWCOIN"), books[&Coin::new("BTC")].clone());
-        let validation = catch_up_and_validate(state.par_clone(), cache(20), target, Snapshots::new(books), true);
+        let validation = catch_up_and_validate(state.clone(), cache(20), target, Snapshots::new(books), true);
         assert!(
             matches!(&validation, Validation::Consistent(extras) if extras.keys().eq([&Coin::new("NEWCOIN")])),
             "{validation:?}"
         );
 
         // Too few cached blocks to reach the snapshot, or a snapshot older than the state.
-        let validation = catch_up_and_validate(state.par_clone(), cache(10), target, later.compute_snapshot(), true);
+        let validation = catch_up_and_validate(state.clone(), cache(10), target, later.compute_snapshot(), true);
         assert!(matches!(validation, Validation::Skipped), "{validation:?}");
-        let validation = catch_up_and_validate(later.par_clone(), cache(0), height, state.compute_snapshot(), true);
+        let validation = catch_up_and_validate(later.clone(), cache(0), height, state.compute_snapshot(), true);
         assert!(matches!(validation, Validation::Skipped), "{validation:?}");
 
         // A snapshot that does not match the caught-up state.
-        let validation = catch_up_and_validate(state.par_clone(), cache(20), target, state.compute_snapshot(), true);
+        let validation = catch_up_and_validate(state.clone(), cache(20), target, state.compute_snapshot(), true);
         assert!(matches!(validation, Validation::Mismatch), "{validation:?}");
     }
 
@@ -1174,5 +1272,68 @@ mod validation_test {
         assert!(err.to_string().contains("[gap-grace-resync]"), "{err}");
         assert!(rx.try_recv().is_err());
         assert_eq!(listener.order_book_state.as_ref().unwrap().height(), height + 3);
+    }
+
+    /// A block's L2 snapshot goes out once its diffs are in, before its statuses;
+    /// only demanded coins have one.
+    #[test]
+    fn l2_snapshot_sent_before_statuses() {
+        let (Ok(json), Ok(blocks)) = (fs::read_to_string(FIXTURE), fs::read_to_string(REPLAY_BLOCKS)) else {
+            eprintln!("skipping: {FIXTURE} or {REPLAY_BLOCKS} not present");
+            return;
+        };
+        let (height, snapshot) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json).unwrap();
+        drop(json);
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let mut listener = OrderBookListener::new(Some(tx), true);
+        let n_coins = snapshot.as_ref().keys().filter(|coin| !coin.is_spot()).count();
+        listener.init_from_snapshot(snapshot, height);
+        assert_eq!(listener.universe().len(), n_coins);
+        let mut demand = ClientL2Demand::new(listener.l2_demand());
+        demand.sync(&[crate::types::subscription::Subscription::L2Book {
+            coin: "BTC".into(),
+            n_sig_figs: None,
+            n_levels: None,
+            mantissa: None,
+        }]
+        .into());
+        let lines = blocks.lines().collect::<Vec<_>>();
+        let mut snapshot_after = |listener: &mut OrderBookListener, line: &str, diffs: bool| {
+            let batch = if diffs {
+                EventBatch::BookDiffs(serde_json::from_str(line).unwrap())
+            } else {
+                EventBatch::Orders(serde_json::from_str(line).unwrap())
+            };
+            listener.receive_batch(batch).unwrap();
+            listener.broadcast_l2_snapshot();
+            let mut snapshot = None;
+            while let Ok(msg) = rx.try_recv() {
+                if let InternalMessage::Snapshot { l2_snapshots, time, universe, .. } = msg.as_ref() {
+                    assert_eq!(universe.len(), n_coins);
+                    let coins: Vec<_> = l2_snapshots.as_ref().keys().cloned().collect();
+                    snapshot = Some((*time, coins));
+                }
+            }
+            snapshot
+        };
+        // Right after init: the snapshot's height (block time unknown).
+        assert_eq!(snapshot_after(&mut listener, lines[0], false), Some((0, vec![Coin::new("BTC")])));
+        for block in 0..3 {
+            let diffs: Batch<NodeDataOrderDiff> = serde_json::from_str(lines[2 * block + 1]).unwrap();
+            let got = snapshot_after(&mut listener, lines[2 * block + 1], true);
+            assert_eq!(got, Some((diffs.block_time(), vec![Coin::new("BTC")])), "block {block}");
+            assert_eq!(listener.order_book_state.as_ref().unwrap().height(), height + 1 + block as u64);
+            if block < 2 {
+                // The statuses bring the L4 book level with the L2 book: nothing new to send.
+                assert_eq!(snapshot_after(&mut listener, lines[2 * block + 2], false), None);
+            }
+        }
+        // Statuses of block 3 are late: the L2 book runs ahead.
+        let diffs: Batch<NodeDataOrderDiff> = serde_json::from_str(lines[7]).unwrap();
+        assert_eq!(snapshot_after(&mut listener, lines[7], true).map(|s| s.0), Some(diffs.block_time()));
+        assert_eq!(listener.order_book_state.as_ref().unwrap().height(), height + 3);
+        assert_eq!(snapshot_after(&mut listener, lines[6], false), None);
+        assert_eq!(listener.order_book_state.as_ref().unwrap().height(), height + 4);
+        assert_eq!(L2_DIVERGENT_TOTAL.load(AtomicOrdering::Relaxed), 0);
     }
 }

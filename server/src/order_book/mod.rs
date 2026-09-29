@@ -1,7 +1,10 @@
 use crate::prelude::*;
 use itertools::Itertools;
 use linked_list::LinkedList;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
 
 pub(crate) mod levels;
 mod linked_list;
@@ -10,12 +13,22 @@ pub(crate) mod types;
 
 pub(crate) use types::{Coin, InnerOrder, Oid, Px, Side, Sz};
 
+/// Price levels are shared copy-on-write (`Arc::make_mut` on every write), so
+/// cloning a book copies its level map, not its orders: the listener clones
+/// every book under its mutex each minute for snapshot validation, and a deep
+/// copy stalled it ~40 ms even in parallel (BTC's book alone, 2026-09-29).
+/// A level is copied on its first write after a clone.
 #[derive(Clone, Default)]
 pub(crate) struct OrderBook<O> {
     oid_to_side_px: HashMap<Oid, (Side, Px)>,
-    bids: BTreeMap<Px, PriceLevel<O>>,
-    asks: BTreeMap<Px, PriceLevel<O>>,
+    bids: Levels<O>,
+    asks: Levels<O>,
+    /// Wrapping sum of `order_hash` over the resting orders: two books with
+    /// the same orders (whatever their queue order) have the same checksum.
+    checksum: u64,
 }
+
+type Levels<O> = BTreeMap<Px, Arc<PriceLevel<O>>>;
 
 /// The orders resting at one price in time priority, plus their total size so
 /// L2 levels don't walk the list. Every change to an order's size must update `sz`.
@@ -72,7 +85,12 @@ impl<O: InnerOrder> Snapshot<O> {
 impl<O: InnerOrder> OrderBook<O> {
     #[must_use]
     pub(crate) fn new() -> Self {
-        Self { oid_to_side_px: HashMap::new(), bids: BTreeMap::new(), asks: BTreeMap::new() }
+        Self { oid_to_side_px: HashMap::new(), bids: BTreeMap::new(), asks: BTreeMap::new(), checksum: 0 }
+    }
+
+    /// See `checksum`; a different one means different orders (or sizes).
+    pub(crate) const fn checksum(&self) -> u64 {
+        self.checksum
     }
 
     pub(crate) fn add_order(&mut self, order: O) {
@@ -89,13 +107,13 @@ impl<O: InnerOrder> OrderBook<O> {
             Side::Ask => (&mut self.bids, &mut self.asks),
             Side::Bid => (&mut self.asks, &mut self.bids),
         };
-        let oids = match_order(maker_orders, &mut order);
+        let oids = match_order(maker_orders, &mut order, &mut self.checksum);
         for oid in oids {
             self.oid_to_side_px.remove(&oid);
         }
         if order.sz().is_positive() {
             self.oid_to_side_px.insert(order.oid(), (order.side(), order.limit_px()));
-            return add_order_to_book(resting_book, order, insert_before);
+            return add_order_to_book(resting_book, order, insert_before, &mut self.checksum);
         }
         true
     }
@@ -107,9 +125,11 @@ impl<O: InnerOrder> OrderBook<O> {
                 Side::Bid => &mut self.bids,
             };
             if let Some(level) = map.get_mut(&px) {
+                let level = Arc::make_mut(level);
                 let removed = level.orders.remove_node(oid);
                 if let Some(order) = &removed {
                     level.sz = level.sz - order.sz();
+                    self.checksum = self.checksum.wrapping_sub(order_hash(order));
                 }
                 if level.orders.is_empty() {
                     map.remove(&px);
@@ -127,16 +147,50 @@ impl<O: InnerOrder> OrderBook<O> {
                 Side::Bid => &mut self.bids,
             };
             if let Some(level) = map.get_mut(px) {
+                let level = Arc::make_mut(level);
                 if let Some(order) = level.orders.node_value_mut(&oid) {
                     let old_sz = order.sz();
+                    let old_hash = order_hash(order);
                     order.modify_sz(sz);
                     level.sz = level.sz - old_sz + order.sz();
+                    self.checksum = self.checksum.wrapping_sub(old_hash).wrapping_add(order_hash(order));
                     return true;
                 }
                 return false;
             }
         }
         false
+    }
+
+    /// The same book, queue order included, with every order mapped by `f`.
+    pub(crate) fn map_orders<P: InnerOrder>(&self, f: impl Fn(&O) -> P) -> OrderBook<P> {
+        let mut checksum = 0u64;
+        let mut map_levels = |levels: &Levels<O>| {
+            levels
+                .iter()
+                .map(|(px, level)| {
+                    let mut orders = LinkedList::new();
+                    for order in level.orders.to_vec() {
+                        let order = f(order);
+                        checksum = checksum.wrapping_add(order_hash(&order));
+                        orders.push_back(order.oid(), order);
+                    }
+                    (*px, Arc::new(PriceLevel { orders, sz: level.sz }))
+                })
+                .collect()
+        };
+        let (bids, asks) = (map_levels(&self.bids), map_levels(&self.asks));
+        OrderBook { oid_to_side_px: self.oid_to_side_px.clone(), bids, asks, checksum }
+    }
+
+    /// Same price levels, each with the same size and number of orders: the same L2 book at full depth.
+    #[cfg(test)]
+    pub(crate) fn same_levels<P: InnerOrder>(&self, other: &OrderBook<P>) -> bool {
+        fn same<O: InnerOrder, P: InnerOrder>(a: &Levels<O>, b: &Levels<P>) -> bool {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|((pa, a), (pb, b))| pa == pb && a.sz == b.sz && a.orders.len() == b.orders.len())
+        }
+        same(&self.bids, &other.bids) && same(&self.asks, &other.asks)
     }
 
     // we go by the convention that prioritized orders go first in the vector; this makes aggregation step later easier.
@@ -160,25 +214,48 @@ impl<O: InnerOrder> OrderBook<O> {
         book
     }
 
-    /// Panics unless every level's `sz` equals the sum of its orders.
+    /// Panics unless every level's `sz` equals the sum of its orders, and
+    /// `checksum` the sum of their hashes.
     #[cfg(test)]
     pub(crate) fn assert_level_sizes(&self) {
+        let mut checksum = 0u64;
         for (px, level) in self.bids.iter().chain(&self.asks) {
             let sz = level.orders.fold(Sz::new(0), |sz, order| *sz = *sz + order.sz());
             assert_eq!(level.sz, sz, "level {px:?}");
             assert_eq!(level.orders.len(), level.orders.fold(0, |n, _| *n += 1), "level {px:?}");
+            checksum = level.orders.fold(checksum, |checksum, order| *checksum = checksum.wrapping_add(order_hash(order)));
         }
+        assert_eq!(self.checksum, checksum);
     }
 }
 
+/// Hash of an order's oid, side, price and size.
+fn order_hash<O: InnerOrder>(order: &O) -> u64 {
+    // splitmix64's finalizer: every input bit affects every output bit.
+    const fn mix(mut x: u64) -> u64 {
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    }
+    let side = match order.side() {
+        Side::Ask => 1,
+        Side::Bid => 2,
+    };
+    mix(mix(mix(mix(order.oid().value()) ^ side) ^ order.limit_px().value()) ^ order.sz().value())
+}
+
 fn add_order_to_book<O: InnerOrder>(
-    map: &mut BTreeMap<Px, PriceLevel<O>>,
+    map: &mut Levels<O>,
     order: O,
     insert_before: Option<Oid>,
+    checksum: &mut u64,
 ) -> bool {
     let oid = order.oid();
     let sz = order.sz();
-    let level = map.entry(order.limit_px()).or_insert_with(PriceLevel::new);
+    let hash = order_hash(&order);
+    let level = Arc::make_mut(map.entry(order.limit_px()).or_insert_with(|| Arc::new(PriceLevel::new())));
     let anchored = insert_before.as_ref().is_none_or(|before| level.orders.contains(before));
     let inserted = match insert_before {
         Some(before) if anchored => level.orders.insert_before(&before, oid, order),
@@ -186,16 +263,17 @@ fn add_order_to_book<O: InnerOrder>(
     };
     if inserted {
         level.sz = level.sz + sz;
+        *checksum = checksum.wrapping_add(hash);
     }
     anchored
 }
 
-fn match_order<O: InnerOrder>(maker_orders: &mut BTreeMap<Px, PriceLevel<O>>, taker_order: &mut O) -> Vec<Oid> {
+fn match_order<O: InnerOrder>(maker_orders: &mut Levels<O>, taker_order: &mut O, checksum: &mut u64) -> Vec<Oid> {
     let mut filled_oids = Vec::new();
     let mut keys_to_remove = Vec::new();
     let taker_side = taker_order.side();
     let limit_px = taker_order.limit_px();
-    let order_iter: Box<dyn Iterator<Item = (&Px, &mut PriceLevel<O>)>> = match taker_side {
+    let order_iter: Box<dyn Iterator<Item = (&Px, &mut Arc<PriceLevel<O>>)>> = match taker_side {
         Side::Ask => Box::new(maker_orders.iter_mut().rev()),
         Side::Bid => Box::new(maker_orders.iter_mut()),
     };
@@ -207,13 +285,17 @@ fn match_order<O: InnerOrder>(maker_orders: &mut BTreeMap<Px, PriceLevel<O>>, ta
         if !matches {
             break;
         }
+        let level = Arc::make_mut(level);
         while let Some(match_order) = level.orders.head_value_ref_mut_unsafe() {
             let old_sz = match_order.sz();
+            *checksum = checksum.wrapping_sub(order_hash(match_order));
             taker_order.fill(match_order);
             level.sz = level.sz - old_sz + match_order.sz();
             if match_order.sz().is_zero() {
                 filled_oids.push(match_order.oid());
                 let _unused = level.orders.remove_front();
+            } else {
+                *checksum = checksum.wrapping_add(order_hash(match_order));
             }
             if taker_order.sz().is_zero() {
                 break;
@@ -457,6 +539,35 @@ mod tests {
         let bids = l2.as_ref()[0].iter().map(|l| (l.px.value(), l.sz.value(), l.n)).collect_vec();
         assert_eq!(bids, vec![(6, 70, 1), (5, 100, 1)]);
         book.assert_level_sizes();
+    }
+
+    /// A clone shares its levels with the original; writes to either copy
+    /// (add, match, modify, cancel) leave the other as it was.
+    #[test]
+    fn clones_do_not_see_each_others_writes() {
+        let mut factory = OrderFactory::default();
+        let mut book = OrderBook::new();
+        for order in factory.batch_order(100, 5, Side::Bid, 3).into_iter().chain(factory.batch_order(50, 7, Side::Ask, 2)) {
+            book.add_order(order);
+        }
+        let before = book.to_snapshot();
+        let copy = book.clone();
+        assert!(Arc::ptr_eq(&book.bids[&Px::new(5)], &copy.bids[&Px::new(5)]));
+        book.add_order(factory.order(120, 5, Side::Ask));
+        assert!(book.modify_sz(Oid::new(2), Sz::new(10)));
+        assert!(book.cancel_order(Oid::new(1)));
+        book.add_order(factory.order(10, 6, Side::Bid));
+        assert_eq!(copy.to_snapshot().as_ref(), before.as_ref());
+        copy.assert_level_sizes();
+        book.assert_level_sizes();
+        // The untouched ask level at 7 is still shared, the bid level at 5 is not.
+        assert!(Arc::ptr_eq(&book.asks[&Px::new(7)], &copy.asks[&Px::new(7)]));
+        assert!(!Arc::ptr_eq(&book.bids[&Px::new(5)], &copy.bids[&Px::new(5)]));
+
+        let mut copy = copy;
+        let after = book.to_snapshot();
+        assert!(copy.cancel_order(Oid::new(0)));
+        assert_eq!(book.to_snapshot().as_ref(), after.as_ref());
     }
 
     fn assert_same_book(s1: Snapshot<MinimalOrder>, s2: Snapshot<MinimalOrder>) {

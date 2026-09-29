@@ -116,6 +116,14 @@ pub(crate) static APPLY_US: Histogram = Histogram::new("apply_us");
 pub(crate) static L2_COMPUTE_US: Histogram = Histogram::new("l2_compute_us");
 /// Coins some client wants a sig-fig L2 variant of, per L2 compute.
 pub(crate) static L2_AGGREGATED_COINS: Histogram = Histogram::new("l2_aggregated_coins");
+/// L2 book apply of one block's diffs, before its statuses arrive (under the listener mutex).
+pub(crate) static L2_APPLY_US: Histogram = Histogram::new("l2_apply_us");
+/// Check of the L2 book against the L4 book after an L4 apply (under the listener mutex).
+pub(crate) static L2_CHECK_US: Histogram = Histogram::new("l2_check_us");
+/// Coins whose L2 book differed from the L4 book, per check that found any (should never be recorded).
+pub(crate) static L2_DIVERGENT_COINS: Histogram = Histogram::new("l2_divergent_coins");
+/// Rebuild of the whole L2 book from the L4 book (after init or an L2 apply error).
+pub(crate) static L2_REBUILD_US: Histogram = Histogram::new("l2_rebuild_us");
 /// Wall clock minus hl-node local_time when a client with a matching
 /// subscription has finished sending that block's message, per stream.
 pub(crate) static CLIENT_L2_AFTER_WRITE_US: Histogram = Histogram::new("client_l2_after_write_us");
@@ -128,7 +136,7 @@ pub(crate) static CLIENT_HANDLE_US: Histogram = Histogram::new("client_handle_us
 /// Messages still queued for a client when it receives one; it is disconnected once this passes 100.
 pub(crate) static CLIENT_QUEUE_LEN: Histogram = Histogram::new("client_queue_len");
 
-static ALL: [&Histogram; 17] = [
+static ALL: [&Histogram; 21] = [
     &HL_WRITE_LAG_MS,
     &APPLY_AFTER_WRITE_US,
     &LOCK_WAIT_US,
@@ -140,6 +148,10 @@ static ALL: [&Histogram; 17] = [
     &APPLY_US,
     &L2_COMPUTE_US,
     &L2_AGGREGATED_COINS,
+    &L2_APPLY_US,
+    &L2_CHECK_US,
+    &L2_DIVERGENT_COINS,
+    &L2_REBUILD_US,
     &CLIENT_L2_AFTER_WRITE_US,
     &CLIENT_L4_AFTER_WRITE_US,
     &CLIENT_ORDER_UPDATES_AFTER_WRITE_US,

@@ -54,6 +54,9 @@ impl Oid {
     pub(crate) const fn new(value: u64) -> Self {
         Self(value)
     }
+    pub(crate) const fn value(&self) -> u64 {
+        self.0
+    }
 }
 
 pub(crate) trait InnerOrder: Clone {
@@ -81,13 +84,17 @@ impl Coin {
     }
 
     pub(crate) fn is_spot(&self) -> bool {
+        Self::is_spot_str(&self.0)
+    }
+
+    pub(crate) fn is_spot_str(coin: &str) -> bool {
         // HyperLiquid spot markets are encoded as `@<n>` (legacy spot index),
         // `#<n>` (newer spot index used for assets like #1180), or the special
         // `PURR/USDC` ticker. Missing the `#` prefix here previously caused
         // spot diffs to fall through `ignore_spot` filtering and crash the
         // listener with "Unable to find order on the book" when the book had
         // not yet been grafted via absorb_extra_books.
-        self.0.starts_with('@') || self.0.starts_with('#') || self.0 == "PURR/USDC"
+        coin.starts_with('@') || coin.starts_with('#') || coin == "PURR/USDC"
     }
 }
 

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
 
 use crate::{
-    order_book::{Coin, Oid},
+    order_book::{Oid, Side},
     types::{Fill, L4Order, OrderDiff},
 };
 
@@ -17,6 +17,10 @@ pub(crate) struct NodeDataOrderDiff {
     oid: u64,
     px: String,
     coin: String,
+    /// Lets the L2 book apply diffs without the order statuses. Not part of
+    /// the L4 book updates clients get, which never had it.
+    #[serde(skip_serializing)]
+    side: Side,
     pub(crate) raw_book_diff: OrderDiff,
 }
 
@@ -28,8 +32,9 @@ impl NodeDataOrderDiff {
         Oid::new(self.oid)
     }
 
-    pub(crate) fn coin(&self) -> Coin {
-        Coin::new(&self.coin)
+    #[cfg(test)]
+    pub(crate) fn coin(&self) -> crate::order_book::Coin {
+        crate::order_book::Coin::new(&self.coin)
     }
 
     pub(crate) fn coin_str(&self) -> &str {
@@ -38,6 +43,10 @@ impl NodeDataOrderDiff {
 
     pub(crate) fn px(&self) -> &str {
         &self.px
+    }
+
+    pub(crate) const fn side(&self) -> Side {
+        self.side
     }
 }
 
