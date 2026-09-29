@@ -1,7 +1,8 @@
 use crate::{
     latency,
     listeners::order_book::{
-        ClientL2Demand, InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, hl_listen,
+        ClientL2Demand, ClientUserDemand, InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener,
+        hl_listen,
     },
     order_book::{Coin, Side},
     prelude::*,
@@ -31,8 +32,8 @@ use tokio::{
 };
 use yawc::{FrameView, OpCode, WebSocket};
 
-/// Broadcast backlog per client, in messages (~40/s: fills, L4 updates and an
-/// L2 snapshot per block), so ~25 s. A client further behind than this loses
+/// Broadcast backlog per client, in messages (~55/s: fills, early orderUpdates,
+/// L4 updates and an L2 snapshot per block), so ~18 s. A client further behind than this loses
 /// messages (see `handle_socket`). Slots are freed as soon as every client has
 /// read them, so the backlog only holds memory while some client is behind.
 const BROADCAST_CAPACITY: usize = 1024;
@@ -126,13 +127,16 @@ async fn handle_socket(
     listener: Arc<Mutex<OrderBookListener>>,
 ) {
     let mut internal_message_rx = internal_message_tx.subscribe();
-    let (is_ready, mut universe, l2_demand) = {
+    let (is_ready, mut universe, l2_demand, user_demand) = {
         let listener = listener.lock().await;
-        (listener.is_ready(), listener.universe(), listener.l2_demand())
+        (listener.is_ready(), listener.universe(), listener.l2_demand(), listener.user_demand())
     };
     let mut manager = SubscriptionManager::default();
-    // Dropped on every return below, which releases this client's sig-fig L2 demand.
+    // Dropped on every return below, which releases this client's L2 and orderUpdates demand.
     let mut l2_demand = ClientL2Demand::new(l2_demand);
+    let mut user_demand = ClientUserDemand::new(user_demand);
+    // (block, users) of the last early orderUpdates, already sent for that block.
+    let mut early_order_updates: Option<(u64, Arc<HashSet<Address>>)> = None;
     if !is_ready {
         let msg = ServerResponse::Error("Order book not ready for streaming (waiting for snapshot)".to_string());
         send_socket_message(&mut socket, msg).await;
@@ -171,10 +175,23 @@ async fn handle_socket(
                                     .then(|| (&latency::CLIENT_FILLS_AFTER_WRITE_US, batch.local_time_us()));
                                 [fills, None]
                             },
-                            InternalMessage::L4BookUpdates{ diff_batch, status_batch } => {
+                            InternalMessage::OrderUpdates{ block_number, local_time_us, users, statuses } => {
                                 let wanted = WantedKeys::new(manager.subscriptions());
+                                let mut user_orders = user_to_order_updates(statuses, &wanted.order_updates);
+                                for sub in manager.subscriptions() {
+                                    send_ws_data_from_order_updates(&mut socket, sub, &mut user_orders).await;
+                                }
+                                early_order_updates = Some((*block_number, users.clone()));
+                                let covered = wanted.order_updates.iter().any(|user| users.contains(user));
+                                [covered.then_some((&latency::CLIENT_ORDER_UPDATES_AFTER_WRITE_US, *local_time_us)), None]
+                            },
+                            InternalMessage::L4BookUpdates{ diff_batch, status_batch } => {
+                                let mut wanted = WantedKeys::new(manager.subscriptions());
+                                if let Some((_, sent)) = early_order_updates.as_ref().filter(|(block, _)| *block == status_batch.block_number()) {
+                                    wanted.order_updates.retain(|user| !sent.contains(user));
+                                }
                                 let mut book_updates = coin_to_book_updates(diff_batch, status_batch, &wanted.l4_books);
-                                let mut user_orders = user_to_order_updates(status_batch, &wanted.order_updates);
+                                let mut user_orders = user_to_order_updates(status_batch.events_ref(), &wanted.order_updates);
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
                                     send_ws_data_from_order_updates(&mut socket, sub, &mut user_orders).await;
@@ -250,6 +267,7 @@ async fn handle_socket(
                                 Ok(value) => {
                                     receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone()).await;
                                     l2_demand.sync(manager.subscriptions());
+                                    user_demand.sync(manager.subscriptions());
                                 }
                                 Err(_) => {
                                     let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
@@ -594,15 +612,12 @@ fn user_to_fills(batch: &Batch<NodeDataFill>, users: &HashSet<Address>) -> HashM
 }
 
 /// Group node order-status events by user and convert each one to a `WsOrder`.
-fn user_to_order_updates(
-    status_batch: &Batch<NodeDataOrderStatus>,
-    users: &HashSet<Address>,
-) -> HashMap<Address, Vec<WsOrder>> {
+fn user_to_order_updates(statuses: &[NodeDataOrderStatus], users: &HashSet<Address>) -> HashMap<Address, Vec<WsOrder>> {
     let mut by_user: HashMap<Address, Vec<WsOrder>> = HashMap::new();
     if users.is_empty() {
         return by_user;
     }
-    for status in status_batch.events_ref().iter().filter(|s| users.contains(&s.user)) {
+    for status in statuses.iter().filter(|s| users.contains(&s.user)) {
         by_user.entry(status.user).or_default().push(WsOrder::from_node_status(status));
     }
     by_user
@@ -871,7 +886,7 @@ mod wanted_keys_test {
             }
             for set in &user_sets {
                 let wanted: HashSet<Address> = set.iter().copied().collect();
-                assert_eq!(sent(user_to_order_updates(sb, &wanted), set), sent(old_order_updates(sb), set));
+                assert_eq!(sent(user_to_order_updates(sb.events_ref(), &wanted), set), sent(old_order_updates(sb), set));
             }
         }
         for fb in &fills {

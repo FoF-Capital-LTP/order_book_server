@@ -110,6 +110,9 @@ pub(crate) static SNAPSHOT_VALIDATE_US: Histogram = Histogram::new("snapshot_val
 /// JSON parse of one order-statuses / order-diffs line (runs under the listener mutex).
 pub(crate) static STATUSES_PARSE_US: Histogram = Histogram::new("statuses_parse_us");
 pub(crate) static DIFFS_PARSE_US: Histogram = Histogram::new("diffs_parse_us");
+/// Finding and parsing the subscribed users' events in one order-statuses line,
+/// before its full parse (runs under the listener mutex).
+pub(crate) static EARLY_ORDER_UPDATES_US: Histogram = Histogram::new("early_order_updates_us");
 /// apply_updates of one block (runs under the listener mutex).
 pub(crate) static APPLY_US: Histogram = Histogram::new("apply_us");
 /// compute_l2_snapshots duration (on the L2 book thread).
@@ -138,7 +141,7 @@ pub(crate) static CLIENT_HANDLE_US: Histogram = Histogram::new("client_handle_us
 /// Messages still queued for a client when it receives one; it is disconnected once this passes 100.
 pub(crate) static CLIENT_QUEUE_LEN: Histogram = Histogram::new("client_queue_len");
 
-static ALL: [&Histogram; 22] = [
+static ALL: [&Histogram; 23] = [
     &HL_WRITE_LAG_MS,
     &APPLY_AFTER_WRITE_US,
     &LOCK_WAIT_US,
@@ -147,6 +150,7 @@ static ALL: [&Histogram; 22] = [
     &SNAPSHOT_VALIDATE_US,
     &STATUSES_PARSE_US,
     &DIFFS_PARSE_US,
+    &EARLY_ORDER_UPDATES_US,
     &APPLY_US,
     &L2_COMPUTE_US,
     &L2_AGGREGATED_COINS,

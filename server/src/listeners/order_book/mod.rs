@@ -84,10 +84,12 @@ const PARSE_FAIL_WARN_INTERVAL: Duration = Duration::from_secs(60);
 const WATCHDOG_INTERVAL_SECS: u64 = 15;
 
 use utils::{BatchQueue, EventBatch, parse_event_line, process_rmp_file, validate_snapshot_consistency};
+pub(crate) use early_order_updates::{ClientUserDemand, UserDemand};
 pub(crate) use l2_demand::{ClientL2Demand, L2Demand};
 #[cfg(test)]
 pub(crate) use utils::compute_l2_snapshots;
 
+mod early_order_updates;
 mod l2_book;
 mod l2_demand;
 mod l2_thread;
@@ -499,6 +501,14 @@ pub(crate) struct OrderBookListener {
     last_applied_local_time_us: u64,
     /// Coins (and their L2 variants) some client subscribes to.
     l2_demand: Arc<L2Demand>,
+    /// Users some client subscribes to orderUpdates of.
+    user_demand: Arc<UserDemand>,
+    /// Block of the last `InternalMessage::OrderUpdates` sent.
+    last_early_order_updates: u64,
+    /// The last `InternalMessage::OrderUpdates` sent, until checked against the full parse of its line.
+    unchecked_early_order_updates: Option<Arc<InternalMessage>>,
+    /// Set once early orderUpdates missed a status: none are sent after.
+    early_order_updates_off: bool,
 }
 
 /// Plan E: tracks "stuck on the same byte offset" state for a single
@@ -556,11 +566,78 @@ impl OrderBookListener {
             parse_fail_order_diffs: ParseFailureTracker::default(),
             last_applied_local_time_us: 0,
             l2_demand,
+            user_demand: Arc::default(),
+            last_early_order_updates: 0,
+            unchecked_early_order_updates: None,
+            early_order_updates_off: false,
         }
     }
 
     pub(crate) fn l2_demand(&self) -> Arc<L2Demand> {
         self.l2_demand.clone()
+    }
+
+    pub(crate) fn user_demand(&self) -> Arc<UserDemand> {
+        self.user_demand.clone()
+    }
+
+    /// Sends the orderUpdates of a complete statuses line's block before the
+    /// line is parsed (see `early_order_updates`), once per block and only for
+    /// blocks whose L4 updates would be sent.
+    fn send_early_order_updates(&mut self, line: &str) {
+        let (Some(tx), Some(state)) = (&self.internal_message_tx, &self.order_book_state) else { return };
+        let users = self.user_demand.users();
+        if users.is_empty() || self.early_order_updates_off {
+            return;
+        }
+        let start = Instant::now();
+        let Some((block_number, local_time_us)) = early_order_updates::header(line) else { return };
+        if block_number <= state.height().max(self.last_early_order_updates) || state.is_gap(block_number) {
+            return;
+        }
+        self.last_early_order_updates = block_number;
+        let Some(statuses) = early_order_updates::statuses_of(line, &users) else { return };
+        latency::EARLY_ORDER_UPDATES_US.record_duration_us(start.elapsed());
+        let msg = Arc::new(InternalMessage::OrderUpdates { block_number, local_time_us, users, statuses });
+        let _unused = tx.send(msg.clone());
+        self.unchecked_early_order_updates = Some(msg);
+    }
+
+    /// Checks the early orderUpdates of `batch`'s block against the batch, before
+    /// its L4 updates go out. Clients leave the users they cover out of those, so
+    /// statuses they missed (if hl-node changed how it writes the line) are sent
+    /// now, and no more are sent early.
+    fn check_early_order_updates(&mut self, batch: &Batch<NodeDataOrderStatus>) {
+        let block = batch.block_number();
+        let Some(msg) = self.unchecked_early_order_updates.take_if(
+            |msg| matches!(msg.as_ref(), InternalMessage::OrderUpdates { block_number, .. } if *block_number == block),
+        ) else {
+            return;
+        };
+        let InternalMessage::OrderUpdates { local_time_us, users, statuses, .. } = msg.as_ref() else { return };
+        let mut sent = statuses.iter().peekable();
+        let mut missed = Vec::new();
+        for status in batch.events_ref().iter().filter(|status| users.contains(&status.user)) {
+            if sent.peek() == Some(&status) {
+                sent.next();
+            } else {
+                missed.push(status.clone());
+            }
+        }
+        if missed.is_empty() && sent.peek().is_none() {
+            return;
+        }
+        error!(
+            "[early-order-updates] block {block}: {} statuses sent early, {} missed, {} not matched; no longer sending them early",
+            statuses.len(),
+            missed.len(),
+            sent.count(),
+        );
+        self.early_order_updates_off = true;
+        if let (false, Some(tx)) = (missed.is_empty(), &self.internal_message_tx) {
+            let (local_time_us, users) = (*local_time_us, users.clone());
+            let _unused = tx.send(Arc::new(InternalMessage::OrderUpdates { block_number: block, local_time_us, users, statuses: missed }));
+        }
     }
 
     /// Plan E: borrow the per-source parse-failure tracker.
@@ -906,6 +983,11 @@ impl DirectoryListener for OrderBookListener {
             if line.is_empty() {
                 continue;
             }
+            // hl-node ends each line with a newline: a line followed by one is complete.
+            let line_end = line.as_ptr() as usize - data.as_ptr() as usize + line.len();
+            if matches!(event_source, EventSource::OrderStatuses) && data.as_bytes().get(line_end) == Some(&b'\n') {
+                self.send_early_order_updates(line);
+            }
             let res = parse_event_line(event_source, line);
             let (height, event_batch) = match res {
                 Ok(data) => data,
@@ -971,6 +1053,9 @@ impl DirectoryListener for OrderBookListener {
                     break;
                 }
             };
+            if let EventBatch::Orders(batch) = &event_batch {
+                self.check_early_order_updates(batch);
+            }
             // Plan E: a parse just succeeded — any prior stuck-offset state for this source
             // is no longer pending (either the torn-write was filled in, or hl-node skipped
             // past it on rotation). Clear the tracker so the next genuine failure is loud.
@@ -1129,6 +1214,15 @@ pub(crate) enum InternalMessage {
     },
     Fills { batch: Batch<NodeDataFill> },
     L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
+    /// The statuses of `users` in a block, sent before its `L4BookUpdates`, which
+    /// clients leave these users' orderUpdates out of. `local_time_us`: hl-node
+    /// write time of the statuses.
+    OrderUpdates {
+        block_number: u64,
+        local_time_us: u64,
+        users: Arc<HashSet<Address>>,
+        statuses: Vec<NodeDataOrderStatus>,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq, Hash)]
@@ -1327,5 +1421,84 @@ mod validation_test {
             assert_eq!(format!("{got:?}"), format!("{:?}", expected[params]), "{params:?}");
         }
         assert_eq!(l2_thread::L2_DIVERGENT_TOTAL.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    /// A block's early orderUpdates come before its L4 updates, with the same
+    /// statuses of the subscribed users, once per block and only from complete lines.
+    #[test]
+    fn early_order_updates_before_l4_updates() {
+        let (Ok(json), Ok(blocks)) = (fs::read_to_string(FIXTURE), fs::read_to_string(REPLAY_BLOCKS)) else {
+            eprintln!("skipping: {FIXTURE} or {REPLAY_BLOCKS} not present");
+            return;
+        };
+        let (height, snapshot) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json).unwrap();
+        drop(json);
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        let mut listener = OrderBookListener::new(Some(tx), true);
+        listener.order_book_state = Some(OrderBookState::from_snapshot(snapshot, height, 0, true, true));
+        let lines = blocks.lines().collect::<Vec<_>>();
+        let statuses: Vec<Batch<NodeDataOrderStatus>> =
+            lines.iter().step_by(2).map(|line| serde_json::from_str(line).unwrap()).collect();
+        let mut counts: HashMap<Address, usize> = HashMap::new();
+        for status in statuses.iter().flat_map(Batch::events_ref) {
+            *counts.entry(status.user).or_default() += 1;
+        }
+        let mut users: Vec<_> = counts.into_iter().collect();
+        users.sort_by_key(|&(user, n)| (std::cmp::Reverse(n), user));
+        let users: Vec<Address> = users.into_iter().take(5).map(|(user, _)| user).collect();
+        let mut demand = ClientUserDemand::new(listener.user_demand());
+        demand.sync(&users.iter().map(|&user| crate::types::subscription::Subscription::OrderUpdates { user }).collect());
+
+        let mut messages = |listener: &mut OrderBookListener, data: &str, source: EventSource| {
+            listener.process_data(data.to_string(), source).unwrap();
+            std::iter::from_fn(|| rx.try_recv().ok()).filter(|msg| !matches!(msg.as_ref(), InternalMessage::Snapshot { .. })).collect::<Vec<_>>()
+        };
+        // Torn: no newline yet, so neither message goes out.
+        assert!(messages(&mut listener, lines[0], EventSource::OrderStatuses).is_empty());
+        let mut n_statuses = 0;
+        let mut pairs: Vec<&[&str]> = lines.chunks(2).collect();
+        let last_two: [&[&str]; 2] = pairs.split_off(pairs.len() - 2).try_into().unwrap();
+        for (block, pair) in pairs.into_iter().enumerate() {
+            let height = height + 1 + block as u64;
+            let early = messages(&mut listener, &format!("{}\n", pair[0]), EventSource::OrderStatuses);
+            let [early] = early.as_slice() else { panic!("block {height}: {} messages", early.len()) };
+            let InternalMessage::OrderUpdates { block_number, users: sent_users, statuses: sent, .. } = early.as_ref() else {
+                panic!("block {height}: not orderUpdates")
+            };
+            assert_eq!((*block_number, sent_users.len()), (height, users.len()));
+            let l4 = messages(&mut listener, &format!("{}\n", pair[1]), EventSource::OrderDiffs);
+            let [l4] = l4.as_slice() else { panic!("block {height}: {} messages", l4.len()) };
+            let InternalMessage::L4BookUpdates { status_batch, .. } = l4.as_ref() else { panic!("block {height}: not L4") };
+            let expected: Vec<_> = status_batch.events_ref().iter().filter(|s| users.contains(&s.user)).cloned().collect();
+            assert_eq!(*sent, expected, "block {height}");
+            n_statuses += sent.len();
+            // A block already applied, or seen early, is not sent again.
+            assert!(messages(&mut listener, &format!("{}\n", pair[0]), EventSource::OrderStatuses).is_empty());
+        }
+        assert!(n_statuses > 100, "{n_statuses}");
+
+        // hl-node writes a user's event differently: the scan misses it, the check sends it.
+        let [late, last] = last_two;
+        let user = format!(r#""user":"{:#x}""#, users[0]);
+        assert!(late[0].contains(&user), "no status of the busiest user in the next to last block");
+        let tampered = late[0].replacen(&user, &user.replace(':', ": "), 1);
+        let msgs = messages(&mut listener, &format!("{tampered}\n"), EventSource::OrderStatuses);
+        let [early, missed] = msgs.as_slice() else { panic!("{} messages", msgs.len()) };
+        let (InternalMessage::OrderUpdates { statuses: early, .. }, InternalMessage::OrderUpdates { statuses: missed, .. }) =
+            (early.as_ref(), missed.as_ref())
+        else {
+            panic!("not orderUpdates")
+        };
+        assert_eq!((missed.len(), missed[0].user), (1, users[0]));
+        let batch: Batch<NodeDataOrderStatus> = serde_json::from_str(late[0]).unwrap();
+        let expected = batch.events_ref().iter().filter(|s| users.contains(&s.user)).count();
+        assert_eq!(early.len() + 1, expected);
+        messages(&mut listener, &format!("{}\n", late[1]), EventSource::OrderDiffs);
+        // No more early ones after that.
+        let msgs = messages(&mut listener, &format!("{}\n", last[0]), EventSource::OrderStatuses);
+        assert!(msgs.is_empty(), "{} messages", msgs.len());
+        let msgs = messages(&mut listener, &format!("{}\n", last[1]), EventSource::OrderDiffs);
+        assert!(matches!(msgs.as_slice(), [msg] if matches!(msg.as_ref(), InternalMessage::L4BookUpdates { .. })));
+        drop(demand);
     }
 }
