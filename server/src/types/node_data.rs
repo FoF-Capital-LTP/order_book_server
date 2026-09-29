@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use alloy::primitives::Address;
 use chrono::NaiveDateTime;
@@ -91,7 +94,8 @@ pub(crate) struct Batch<E> {
     local_time: NaiveDateTime,
     block_time: NaiveDateTime,
     block_number: u64,
-    events: Vec<E>,
+    /// Shared, so a clone is cheap: the listener and the L2 book thread both keep a block's diffs.
+    events: Arc<Vec<E>>,
 }
 
 impl<E> Batch<E> {
@@ -109,8 +113,11 @@ impl<E> Batch<E> {
         self.block_number
     }
 
-    pub(crate) fn events(self) -> Vec<E> {
-        self.events
+    pub(crate) fn events(self) -> Vec<E>
+    where
+        E: Clone,
+    {
+        Arc::unwrap_or_clone(self.events)
     }
 
     pub(crate) fn events_ref(&self) -> &[E] {
@@ -154,7 +161,7 @@ impl<E: DeserializeOwned + Send> Batch<E> {
             .with_min_len(PAR_PARSE_MIN_EVENTS)
             .map(|event| serde_json::from_str(event.get()))
             .collect::<serde_json::Result<Vec<E>>>()?;
-        Ok(Self { local_time, block_time, block_number, events })
+        Ok(Self { local_time, block_time, block_number, events: Arc::new(events) })
     }
 }
 

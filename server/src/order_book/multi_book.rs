@@ -90,6 +90,15 @@ impl<O: InnerOrder> OrderBooks<O> {
         self.order_books.insert(coin, Arc::new(book));
     }
 
+    /// The books of those of `coins` this has, shared; none count as changed.
+    // Anonymous lifetimes in `impl Trait` arguments are not stable yet.
+    #[allow(single_use_lifetimes)]
+    pub(crate) fn subset<'a>(&self, coins: impl IntoIterator<Item = &'a Coin>) -> Self {
+        let order_books =
+            coins.into_iter().filter_map(|coin| self.order_books.get_key_value(coin)).map(|(c, b)| (c.clone(), b.clone()));
+        Self { order_books: order_books.collect(), changed: HashSet::new() }
+    }
+
     /// Replaces (None: stops tracking) the book of `coin`.
     pub(crate) fn replace_book(&mut self, coin: &Coin, book: Option<Arc<OrderBook<O>>>) {
         self.mark_changed(coin);

@@ -345,11 +345,6 @@ impl<T> BatchQueue<T> {
         self.deque.front()
     }
 
-    /// Queued batches, oldest first.
-    pub(super) fn iter(&self) -> impl Iterator<Item = &Batch<T>> {
-        self.deque.iter()
-    }
-
     pub(super) fn clear(&mut self) {
         self.deque.clear();
         self.last_ts = None;

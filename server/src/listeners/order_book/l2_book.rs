@@ -13,6 +13,12 @@
 //! checksums (see `OrderBook::checksum`), and a differing coin is rebuilt from
 //! the L4 book and counted (`l2_divergent_coins`). Comparing the changed coins'
 //! levels instead took ~3 ms per block (2026-09-29).
+//!
+//! The book lives on a thread of its own (see `l2_thread`) and is checked
+//! against `L4View`s: the L4 book's books of the coins to check, shared
+//! copy-on-write. The listener picks the coins (`CheckPlan`); the L2 thread
+//! drops a view once checked, as the L4 book's next write to a book still
+//! shared copies it.
 
 use crate::{
     latency,
@@ -42,6 +48,87 @@ const MAX_UNCHECKED_BLOCKS: u64 = 100;
 /// (~1400) about every 5 s at ~14.5 blocks/s. 100 added ~90 µs per check to
 /// the ~100 µs of the changed ones (2026-09-29).
 const SWEEP_COINS: usize = 20;
+
+/// The L4 book's books of some coins at its current block.
+pub(super) struct L4View {
+    height: u64,
+    time: u64,
+    ignore_spot: bool,
+    /// The coins covered (no spot if `ignore_spot`); those `books` lacks have no L4 book.
+    coins: HashSet<Coin>,
+    books: OrderBooks<InnerL4Order>,
+}
+
+impl L4View {
+    /// Every book of `l4`.
+    pub(super) fn full(l4: &OrderBookState) -> Self {
+        Self::of(l4, l4.books().as_ref().keys().cloned().collect())
+    }
+
+    /// The books of `coins` in `l4`.
+    pub(super) fn of(l4: &OrderBookState, mut coins: HashSet<Coin>) -> Self {
+        let ignore_spot = l4.ignore_spot();
+        coins.retain(|coin| !(ignore_spot && coin.is_spot()));
+        Self { height: l4.height(), time: l4.time(), ignore_spot, books: l4.books().subset(&coins), coins }
+    }
+
+    pub(super) const fn height(&self) -> u64 {
+        self.height
+    }
+}
+
+/// Which of the L4 book's books the L2 book is checked against, and when.
+#[derive(Default)]
+pub(super) struct CheckPlan {
+    /// Coins the L4 book changed since the L2 book was last checked against it.
+    unchecked: HashSet<Coin>,
+    unchecked_blocks: u64,
+    /// Coins still to compare this round (see `SWEEP_COINS`).
+    sweep: Vec<Coin>,
+}
+
+impl CheckPlan {
+    /// The view to check the L2 book against after `l4` changed the books of
+    /// `changed`, or None to wait for `l4` to catch up with it. `l2_height`: of
+    /// the L2 book once it has the diffs sent so far; `l2_universe`: its coins.
+    pub(super) fn next(
+        &mut self,
+        l4: &OrderBookState,
+        changed: HashSet<Coin>,
+        l2_height: u64,
+        l2_universe: &HashSet<String>,
+    ) -> Option<L4View> {
+        let ignore_spot = l4.ignore_spot();
+        self.unchecked.extend(changed.into_iter().filter(|coin| !(ignore_spot && coin.is_spot())));
+        let coins = if l2_height <= l4.height() {
+            let mut coins = std::mem::take(&mut self.unchecked);
+            // A few more every check, in case a book changed unnoticed.
+            if self.sweep.is_empty() {
+                let l4_coins = l4.books().as_ref().keys().cloned();
+                let all: HashSet<_> = l4_coins.chain(l2_universe.iter().map(|coin| Coin::new(coin))).collect();
+                self.sweep = all.into_iter().filter(|coin| !(ignore_spot && coin.is_spot())).collect();
+            }
+            let n = self.sweep.len().min(SWEEP_COINS);
+            coins.extend(self.sweep.drain(..n));
+            coins
+        } else {
+            // Normally the next L4 block catches up with the L2 book.
+            self.unchecked_blocks += 1;
+            if self.unchecked_blocks < MAX_UNCHECKED_BLOCKS {
+                return None;
+            }
+            std::mem::take(&mut self.unchecked)
+        };
+        self.unchecked_blocks = 0;
+        Some(L4View::of(l4, coins))
+    }
+
+    /// For an L2 book rebuilt from every L4 book.
+    pub(super) fn reset(&mut self) {
+        self.unchecked.clear();
+        self.unchecked_blocks = 0;
+    }
+}
 
 /// What an L2 level needs of a resting order.
 #[derive(Clone, Debug)]
@@ -106,35 +193,27 @@ pub(super) struct L2BookState {
     l2_cache: HashMap<Coin, Arc<CoinL2Snapshots>>,
     /// Coins clients may subscribe to (spot left out if `ignore_spot`).
     universe: Arc<HashSet<String>>,
-    /// Coins the L4 book changed since this book was last checked against it.
-    unchecked: HashSet<Coin>,
-    unchecked_blocks: u64,
-    /// Coins still to compare this round (see `SWEEP_COINS`).
-    sweep: Vec<Coin>,
 }
 
 // Anonymous lifetimes in `impl Trait` arguments are not stable yet.
 #[allow(single_use_lifetimes)]
 impl L2BookState {
-    /// The L2 book of `l4`, brought forward with `pending`: the diffs of the
-    /// blocks after `l4`'s, in order. `local_time_us`: of `l4`'s last block.
+    /// The L2 book of `l4` (a full view), brought forward with `pending`: the
+    /// diffs of the blocks after `l4`'s, in order. `local_time_us`: of `l4`'s last block.
     pub(super) fn from_l4<'a>(
-        l4: &OrderBookState,
+        l4: &L4View,
         pending: impl IntoIterator<Item = &'a Batch<NodeDataOrderDiff>>,
         local_time_us: u64,
     ) -> Result<Self> {
         let mut state = Self {
             books: l2_books(l4, |_| true),
-            height: l4.height(),
-            time: l4.time(),
+            height: l4.height,
+            time: l4.time,
             local_time_us,
-            ignore_spot: l4.ignore_spot(),
+            ignore_spot: l4.ignore_spot,
             snapped: false,
             l2_cache: HashMap::new(),
             universe: Arc::default(),
-            unchecked: HashSet::new(),
-            unchecked_blocks: 0,
-            sweep: Vec::new(),
         };
         state.refresh_universe();
         for diffs in pending {
@@ -180,66 +259,47 @@ impl L2BookState {
         Ok(true)
     }
 
-    /// Checks the coins `l4` changed (`changed`) against this book, which must
-    /// not be behind it; call after every change to `l4`. Coins whose books
-    /// differ are rebuilt from `l4` and returned. `pending`: the diffs of the
-    /// blocks after `l4`'s, in order, needed while this book is ahead.
+    /// Checks the coins of `l4` (see `CheckPlan`) against this book, which
+    /// must not be behind it. Coins whose books differ are rebuilt from `l4`
+    /// and returned. `pending`: the diffs of the blocks after `l4`'s, in order,
+    /// needed if this book is ahead.
     pub(super) fn check<'a>(
         &mut self,
-        l4: &OrderBookState,
-        changed: HashSet<Coin>,
+        l4: &L4View,
         pending: impl IntoIterator<Item = &'a Batch<NodeDataOrderDiff>>,
     ) -> Result<Vec<Coin>> {
-        let ignore_spot = self.ignore_spot;
-        self.unchecked.extend(changed.into_iter().filter(|coin| !(ignore_spot && coin.is_spot())));
-        if self.height < l4.height() {
-            return Err(format!("L2 book at block {} is behind the L4 book at {}", self.height, l4.height()).into());
+        if self.height < l4.height {
+            return Err(format!("L2 book at block {} is behind the L4 book at {}", self.height, l4.height).into());
         }
-        let (divergent, rebuilt) = if self.height == l4.height() {
-            let mut coins = std::mem::take(&mut self.unchecked);
-            // A few more every check, in case a book changed unnoticed.
-            if self.sweep.is_empty() {
-                let all: HashSet<_> = self.books.as_ref().keys().chain(l4.books().as_ref().keys()).collect();
-                self.sweep = all.into_iter().filter(|coin| !(ignore_spot && coin.is_spot())).cloned().collect();
-            }
-            let n = self.sweep.len().min(SWEEP_COINS);
-            coins.extend(self.sweep.drain(..n));
-            let divergent = differing(&coins, &self.books, l4.books());
+        let (divergent, rebuilt) = if self.height == l4.height {
+            let divergent = differing(&l4.coins, &self.books, &l4.books);
             let rebuilt = self.rebuild(l4, &divergent, [])?;
             (divergent, rebuilt)
         } else {
-            // Normally the next L4 block catches up with this book.
-            self.unchecked_blocks += 1;
-            if self.unchecked_blocks < MAX_UNCHECKED_BLOCKS {
-                return Ok(Vec::new());
-            }
-            let coins = std::mem::take(&mut self.unchecked);
-            let rebuilt = self.rebuild(l4, &coins, pending)?;
-            (differing(&coins, &self.books, &rebuilt), rebuilt)
+            let rebuilt = self.rebuild(l4, &l4.coins, pending)?;
+            (differing(&l4.coins, &self.books, &rebuilt), rebuilt)
         };
-        self.unchecked_blocks = 0;
         self.replace_books(&divergent, &rebuilt);
         Ok(divergent.into_iter().collect())
     }
 
-    /// Replaces the books of `coins` with ones rebuilt from `l4` (see `check`),
-    /// e.g. after they were grafted into `l4` from a fetched snapshot.
+    /// Replaces the books of `l4`'s coins with ones rebuilt from it (see
+    /// `check`), e.g. after they were grafted into the L4 book from a fetched snapshot.
     pub(super) fn graft<'a>(
         &mut self,
-        l4: &OrderBookState,
-        coins: &HashSet<Coin>,
+        l4: &L4View,
         pending: impl IntoIterator<Item = &'a Batch<NodeDataOrderDiff>>,
     ) -> Result<()> {
-        let rebuilt = self.rebuild(l4, coins, pending)?;
-        self.replace_books(coins, &rebuilt);
+        let rebuilt = self.rebuild(l4, &l4.coins, pending)?;
+        self.replace_books(&l4.coins, &rebuilt);
         Ok(())
     }
 
-    /// The L2 books of `coins` at this book's height: `l4`'s, brought forward
-    /// with `pending` (see `check`).
+    /// The L2 books of `coins` (all covered by `l4`) at this book's height:
+    /// `l4`'s, brought forward with `pending` (see `check`).
     fn rebuild<'a>(
         &self,
-        l4: &OrderBookState,
+        l4: &L4View,
         coins: &HashSet<Coin>,
         pending: impl IntoIterator<Item = &'a Batch<NodeDataOrderDiff>>,
     ) -> Result<OrderBooks<L2Order>> {
@@ -247,7 +307,7 @@ impl L2BookState {
             return Ok(OrderBooks::default());
         }
         let mut rebuilt = l2_books(l4, |coin| coins.contains(coin));
-        let mut next = l4.height() + 1;
+        let mut next = l4.height + 1;
         for diffs in pending {
             let height = diffs.block_number();
             if height < next || height > self.height {
@@ -325,9 +385,9 @@ impl L2BookState {
 }
 
 /// L2 copies of the books of `l4` whose coin `keep` accepts (never spot if `l4` ignores it).
-fn l2_books(l4: &OrderBookState, keep: impl Fn(&Coin) -> bool + Sync) -> OrderBooks<L2Order> {
-    let ignore_spot = l4.ignore_spot();
-    l4.books().par_map(|coin| keep(coin) && !(ignore_spot && coin.is_spot()), |order| L2Order::from(order))
+fn l2_books(l4: &L4View, keep: impl Fn(&Coin) -> bool + Sync) -> OrderBooks<L2Order> {
+    let ignore_spot = l4.ignore_spot;
+    l4.books.par_map(|coin| keep(coin) && !(ignore_spot && coin.is_spot()), |order| L2Order::from(order))
 }
 
 /// Applies a block's diffs (only those of `only`'s coins if Some) to `books`.
@@ -394,6 +454,21 @@ mod tests {
         Some((OrderBookState::from_snapshot(snapshot, height, 0, true, true), blocks))
     }
 
+    /// Checks `l2` the way the listener has it checked after `l4` changed `changed`.
+    #[allow(single_use_lifetimes)]
+    fn check<'a>(
+        l2: &mut L2BookState,
+        plan: &mut CheckPlan,
+        l4: &OrderBookState,
+        changed: HashSet<Coin>,
+        pending: impl IntoIterator<Item = &'a Batch<NodeDataOrderDiff>>,
+    ) -> Result<Vec<Coin>> {
+        match plan.next(l4, changed, l2.height(), &l2.universe()) {
+            Some(view) => l2.check(&view, pending),
+            None => Ok(Vec::new()),
+        }
+    }
+
     fn same_l2(a: &Snapshot<InnerLevel>, b: &Snapshot<InnerLevel>) -> bool {
         a.as_ref().iter().zip(b.as_ref()).all(|(a, b)| {
             a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.px == b.px && a.sz == b.sz && a.n == b.n)
@@ -424,7 +499,7 @@ mod tests {
     fn l2_book_matches_l4_book_on_real_blocks() {
         let Some((mut l4, blocks)) = load() else { return };
         let start = Instant::now();
-        let mut l2 = L2BookState::from_l4(&l4, [], 0).unwrap();
+        let mut l2 = L2BookState::from_l4(&L4View::full(&l4), [], 0).unwrap();
         let rebuild_time = start.elapsed();
         l4.take_changed();
         assert!(l2.books.as_ref().keys().all(|coin| !coin.is_spot()));
@@ -436,6 +511,7 @@ mod tests {
         let (mut apply_time, mut check_time, mut l2_time) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
         let mut prev: HashMap<Coin, Arc<CoinL2Snapshots>> = HashMap::new();
         let mut lagging: VecDeque<&Block> = VecDeque::new();
+        let mut plan = CheckPlan::default();
         for block in &blocks {
             let start = Instant::now();
             assert!(l2.apply(&block.1).unwrap());
@@ -452,7 +528,7 @@ mod tests {
                 l4.apply_updates(statuses, diffs).unwrap();
                 let changed = l4.take_changed();
                 let start = Instant::now();
-                let divergent = l2.check(&l4, changed, lagging.iter().map(|block| &block.1)).unwrap();
+                let divergent = check(&mut l2, &mut plan, &l4, changed, lagging.iter().map(|block| &block.1)).unwrap();
                 check_time += start.elapsed();
                 assert!(divergent.is_empty(), "block {}: {divergent:?}", l4.height());
                 n_checks += 1;
@@ -470,7 +546,7 @@ mod tests {
                 let extras = HashMap::from([(coin("NEWCOIN"), btc), (coin("SOL"), sol)]);
                 let coins = extras.keys().cloned().collect();
                 l4.absorb_extra_books(extras, true);
-                l2.graft(&l4, &coins, []).unwrap();
+                l2.graft(&L4View::of(&l4, coins), []).unwrap();
                 assert!(l2.universe().contains("NEWCOIN"));
                 demand.insert(coin("NEWCOIN"), false);
             }
@@ -534,7 +610,7 @@ mod tests {
     #[test]
     fn divergent_coins_are_found_and_rebuilt() {
         let Some((mut l4, blocks)) = load() else { return };
-        let mut l2 = L2BookState::from_l4(&l4, [], 0).unwrap();
+        let mut l2 = L2BookState::from_l4(&L4View::full(&l4), [], 0).unwrap();
         let coin = |name: &str| Coin::new(name);
         // BTC loses a bid, ETH its book; a coin L4 does not have appears.
         let corrupt = |l2: &mut L2BookState| {
@@ -548,7 +624,7 @@ mod tests {
         l2.books.replace_book(&coin("BOGUS"), l2.books.as_ref().get(&coin("SOL")).cloned());
 
         let changed = HashSet::from([coin("BTC"), coin("ETH"), coin("BOGUS"), coin("SOL")]);
-        let mut divergent = l2.check(&l4, changed, []).unwrap();
+        let mut divergent = l2.check(&L4View::of(&l4, changed), []).unwrap();
         divergent.sort();
         assert_eq!(divergent, [coin("BOGUS"), coin("BTC"), coin("ETH")]);
         assert_same_books(&l2, &l4);
@@ -560,16 +636,18 @@ mod tests {
         }
         corrupt(&mut l2);
         let pending = || blocks[..3].iter().map(|block| &block.1);
+        let mut plan = CheckPlan::default();
         for _ in 1..MAX_UNCHECKED_BLOCKS {
-            assert!(l2.check(&l4, HashSet::from([coin("BTC")]), pending()).unwrap().is_empty());
+            assert!(plan.next(&l4, HashSet::from([coin("BTC")]), l2.height(), &l2.universe()).is_none());
         }
-        let mut divergent = l2.check(&l4, HashSet::from([coin("ETH")]), pending()).unwrap();
+        let view = plan.next(&l4, HashSet::from([coin("ETH")]), l2.height(), &l2.universe()).unwrap();
+        let mut divergent = l2.check(&view, pending()).unwrap();
         divergent.sort();
         assert_eq!(divergent, [coin("BTC"), coin("ETH")]);
         for (i, (statuses, diffs)) in blocks[..3].iter().enumerate() {
             l4.apply_updates(statuses, diffs).unwrap();
             let changed = l4.take_changed();
-            assert!(l2.check(&l4, changed, pending().skip(i + 1)).unwrap().is_empty());
+            assert!(check(&mut l2, &mut plan, &l4, changed, pending().skip(i + 1)).unwrap().is_empty());
         }
         assert_same_books(&l2, &l4);
 
@@ -578,17 +656,17 @@ mod tests {
             l2.apply(diffs).unwrap();
         }
         for _ in 1..MAX_UNCHECKED_BLOCKS {
-            l2.check(&l4, HashSet::from([coin("BTC")]), [&blocks[4].1]).unwrap();
+            check(&mut l2, &mut plan, &l4, HashSet::from([coin("BTC")]), [&blocks[4].1]).unwrap();
         }
-        assert!(l2.check(&l4, HashSet::new(), [&blocks[4].1]).is_err());
+        assert!(check(&mut l2, &mut plan, &l4, HashSet::new(), [&blocks[4].1]).is_err());
         // Nor can the L2 book be behind the L4 book.
-        let mut l2 = L2BookState::from_l4(&l4, [], 0).unwrap();
+        let mut l2 = L2BookState::from_l4(&L4View::full(&l4), [], 0).unwrap();
         l4.apply_updates(&blocks[3].0, &blocks[3].1).unwrap();
         let changed = l4.take_changed();
-        assert!(l2.check(&l4, changed, []).is_err());
+        assert!(l2.check(&L4View::of(&l4, changed), []).is_err());
 
         // An order level sizes cannot tell from another is found too.
-        let mut l2 = L2BookState::from_l4(&l4, [], 0).unwrap();
+        let mut l2 = L2BookState::from_l4(&L4View::full(&l4), [], 0).unwrap();
         let (statuses, diffs) = &blocks[4];
         l2.apply(diffs).unwrap();
         l4.apply_updates(statuses, diffs).unwrap();
@@ -601,7 +679,7 @@ mod tests {
         l2.books.replace_book(&coin("BTC"), Some(Arc::new(btc)));
         let changed = l4.take_changed();
         assert!(changed.contains(&coin("BTC")));
-        assert_eq!(l2.check(&l4, changed, []).unwrap(), [coin("BTC")]);
+        assert_eq!(l2.check(&L4View::of(&l4, changed), []).unwrap(), [coin("BTC")]);
         assert_same_books(&l2, &l4);
 
         // One no diff touches is found by the sweep, within a round.
@@ -615,7 +693,9 @@ mod tests {
             .clone();
         l2.books.replace_book(&quiet, None);
         let rounds = l2.books.as_ref().len().div_ceil(SWEEP_COINS) + 1;
-        let found = (0..rounds).find_map(|_| Some(l2.check(&l4, HashSet::new(), []).unwrap()).filter(|d| !d.is_empty()));
+        let mut plan = CheckPlan::default();
+        let found = (0..rounds)
+            .find_map(|_| Some(check(&mut l2, &mut plan, &l4, HashSet::new(), []).unwrap()).filter(|d| !d.is_empty()));
         assert_eq!(found, Some(vec![quiet]));
         assert_same_books(&l2, &l4);
     }
@@ -624,12 +704,12 @@ mod tests {
     fn apply_takes_blocks_in_order() {
         let Some((l4, blocks)) = load() else { return };
         // Built with the diffs of later blocks, skipping those it has.
-        let mut l2 = L2BookState::from_l4(&l4, blocks[..3].iter().map(|block| &block.1), 7).unwrap();
+        let mut l2 = L2BookState::from_l4(&L4View::full(&l4), blocks[..3].iter().map(|block| &block.1), 7).unwrap();
         assert_eq!(l2.height(), l4.height() + 3);
         assert!(!l2.apply(&blocks[2].1).unwrap());
         assert!(l2.apply(&blocks[4].1).is_err(), "block 4 before block 3");
-        assert!(L2BookState::from_l4(&l4, [&blocks[1].1], 7).is_err());
-        let l2 = L2BookState::from_l4(&l4, [], 7).unwrap();
+        assert!(L2BookState::from_l4(&L4View::full(&l4), [&blocks[1].1], 7).is_err());
+        let l2 = L2BookState::from_l4(&L4View::full(&l4), [], 7).unwrap();
         assert_eq!((l2.height(), l2.local_time_us), (l4.height(), 7));
     }
 }

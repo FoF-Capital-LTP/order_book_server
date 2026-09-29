@@ -112,13 +112,15 @@ pub(crate) static STATUSES_PARSE_US: Histogram = Histogram::new("statuses_parse_
 pub(crate) static DIFFS_PARSE_US: Histogram = Histogram::new("diffs_parse_us");
 /// apply_updates of one block (runs under the listener mutex).
 pub(crate) static APPLY_US: Histogram = Histogram::new("apply_us");
-/// compute_l2_snapshots duration (runs under the listener mutex).
+/// compute_l2_snapshots duration (on the L2 book thread).
 pub(crate) static L2_COMPUTE_US: Histogram = Histogram::new("l2_compute_us");
 /// Coins some client wants a sig-fig L2 variant of, per L2 compute.
 pub(crate) static L2_AGGREGATED_COINS: Histogram = Histogram::new("l2_aggregated_coins");
-/// L2 book apply of one block's diffs, before its statuses arrive (under the listener mutex).
+/// Wall clock minus hl-node local_time when the L2 book thread takes a block's diffs.
+pub(crate) static L2_DIFFS_AFTER_WRITE_US: Histogram = Histogram::new("l2_diffs_after_write_us");
+/// L2 book apply of one block's diffs, before its statuses arrive (on the L2 book thread).
 pub(crate) static L2_APPLY_US: Histogram = Histogram::new("l2_apply_us");
-/// Check of the L2 book against the L4 book after an L4 apply (under the listener mutex).
+/// Check of the L2 book against the L4 book after an L4 apply (on the L2 book thread).
 pub(crate) static L2_CHECK_US: Histogram = Histogram::new("l2_check_us");
 /// Coins whose L2 book differed from the L4 book, per check that found any (should never be recorded).
 pub(crate) static L2_DIVERGENT_COINS: Histogram = Histogram::new("l2_divergent_coins");
@@ -136,7 +138,7 @@ pub(crate) static CLIENT_HANDLE_US: Histogram = Histogram::new("client_handle_us
 /// Messages still queued for a client when it receives one; it is disconnected once this passes 100.
 pub(crate) static CLIENT_QUEUE_LEN: Histogram = Histogram::new("client_queue_len");
 
-static ALL: [&Histogram; 21] = [
+static ALL: [&Histogram; 22] = [
     &HL_WRITE_LAG_MS,
     &APPLY_AFTER_WRITE_US,
     &LOCK_WAIT_US,
@@ -148,6 +150,7 @@ static ALL: [&Histogram; 21] = [
     &APPLY_US,
     &L2_COMPUTE_US,
     &L2_AGGREGATED_COINS,
+    &L2_DIFFS_AFTER_WRITE_US,
     &L2_APPLY_US,
     &L2_CHECK_US,
     &L2_DIVERGENT_COINS,
